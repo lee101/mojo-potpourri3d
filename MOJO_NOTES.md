@@ -33,6 +33,17 @@ list; re-run them after any toolchain bump rather than trusting this file.
   A hardcoded `comptime W = 4` is always valid and is often the better choice.
 - `SIMD` has no `.min()` / `.max()` methods. The free `min(a, b)` / `max(a, b)`
   work on both scalars and `SIMD` values.
+- `std.math` has **no `fabs`**; it is spelled `abs`, and can be imported under
+  any name: `from std.math import abs as fabs`. `sqrt`, `atan2`, `cos`, `sin` and
+  `isfinite` are all in `std.math` as expected.
+- Booleans are `True` / `False`; the Python spelling does not compile.
+- Declaring a local without an initialiser, then assigning in both arms of an
+  if/else, is accepted and is the clean way to write a branch that would
+  otherwise warn about a dead store: `var x: Float64` then `if ...: x = a
+  else: x = b`.
+- A scalar `Float64 / Int` division is an error; the `Int` has to be converted:
+  `a / Float64(n)`. Same for a comparison against an `Int64` loaded out of a
+  buffer.
 
 ## 2. Export / FFI
 

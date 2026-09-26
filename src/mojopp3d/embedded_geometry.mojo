@@ -90,10 +90,8 @@ def compute_vertex_normals(
             normal_sum = normal_sum + Vec3(
                 face_normals.unsafe_load(3 * f), face_normals.unsafe_load(3 * f + 1), face_normals.unsafe_load(3 * f + 2)
             ) * weight
-            if not mesh.is_interior(he):
-                break
             he = mesh.twin(mesh.next(mesh.next(he)))
-            if he < 0 or he == first_he:
+            if he == first_he:
                 break
         var l = normal_sum.norm()
         if l > 0.0:
@@ -132,10 +130,8 @@ def compute_vertex_tangent_basis(
 
             basis_x_sum = basis_x_sum + e_vec_x
 
-            if not mesh.is_interior(he):
-                break
             he = mesh.twin(mesh.next(mesh.next(he)))
-            if he < 0 or he == first_he:
+            if he == first_he:
                 break
 
         var l = basis_x_sum.norm()

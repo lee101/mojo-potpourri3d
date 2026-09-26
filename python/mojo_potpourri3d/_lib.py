@@ -24,7 +24,7 @@ P = ctypes.c_void_p
 
 # name -> (argtypes, restype)
 _SIGNATURES: dict[str, tuple[list, object]] = {
-    "mpp3d_build_halfedge_mesh": ([P, I, I] + [P] * 11, None),
+    "mpp3d_build_halfedge_mesh": ([P, I, I] + [P] * 11 + [P], I),
     "mpp3d_rcm": ([I, P, P, P, P, P, P], None),
     "mpp3d_adjacency_pattern": ([I, P, P, I, P, P], I),
     "mpp3d_vector_extend_scalar_rhs": ([P] * 6 + [I] * 3 + [P, P, I, P, P], None),
@@ -33,7 +33,7 @@ _SIGNATURES: dict[str, tuple[list, object]] = {
     "mpp3d_heat_compute_divergence": ([P] * 6 + [I] * 3 + [P] * 4, None),
     "mpp3d_heat_shift_distance": ([P] * 6 + [I] * 3 + [P, P, P, I, P], F),
     "mpp3d_source_face_corner": ([P] * 6 + [I] * 3 + [I, P], None),
-    "mpp3d_permute_upper": ([I, P, P, P, P, I, P, P, P, P, P, P, P, P, P, P, P], I),
+    "mpp3d_permute_upper": ([I, P, P, P, P, I, P, P, P, P, P, P, P, P, P, P, P, P, P, P], I),
     "mpp3d_ldl_symbolic": ([I] + [P] * 17 + [I], I),
     "mpp3d_ldl_numeric": ([I, I] + [P] * 13, None),
     "mpp3d_ldl_solve": ([I, P, P, P, P, P, P, I], None),
@@ -59,6 +59,25 @@ _SIGNATURES: dict[str, tuple[list, object]] = {
     "mpp3d_cotan_laplacian_triplets": ([P, P, I, F, P, P, P], I),
     "mpp3d_face_areas": ([P, P, I, P], I),
     "mpp3d_vertex_areas": ([P, P, I, I, P, P], I),
+    "mpp3d_build_general_mesh": ([P, I, I] + [P] * 9 + [P] * 5, None),
+    "mpp3d_general_write_faces": ([P] * 9 + [P], None),
+    "mpp3d_general_write_twins": ([P] * 9 + [P, P], None),
+    "mpp3d_general_write_halfedge_edge_lengths": ([P] * 9 + [P, P], None),
+    "mpp3d_general_duplicate_face": ([P] * 9 + [I], I),
+    "mpp3d_general_invert_orientation": ([P] * 9 + [I], None),
+    "mpp3d_general_separate_to_new_edge": ([P] * 9 + [I, I], I),
+    "mpp3d_general_flip": ([P] * 9 + [I], I),
+    "mpp3d_mollify_intrinsic": ([P] * 9 + [P, I, F], F),
+    "mpp3d_build_intrinsic_tufted_cover": (
+        [P] * 9 + [P, I, I, P, P, P, P, I, I, I], I,
+    ),
+    "mpp3d_flip_to_delaunay": ([P] * 9 + [P, I, P, P, I, F], I),
+    "mpp3d_pc_neighbors": ([P, I, I, P, P, P], None),
+    "mpp3d_pc_normals": ([P, P, I, I, P, P, P], None),
+    "mpp3d_pc_tangent_coordinates": ([P, P, P, I, I, P], None),
+    "mpp3d_pc_local_triangulation": (
+        [P, P, I, I, I, P, P, P, P, P], I,
+    ),
 }
 
 

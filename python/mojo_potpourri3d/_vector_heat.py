@@ -1,9 +1,9 @@
 """VectorHeatMethodSolver, the Python half.
 
-Same shape as `_heat.py`: the geometry comes from `IntrinsicGeometry`, the
-factorizations from `mojopp3d.linalg`, and the two complex operators -- the
-vertex connection Laplacian and the affine connection Laplacian -- are
-assembled by the Mojo kernels and factored here.
+Same shape as `_heat.py`: the geometry comes from `IntrinsicGeometry` and the
+two complex factorizations -- the scalar heat operator behind `extend_scalar`
+and the vertex connection Laplacian behind `transport_tangent_vectors` -- are
+assembled here and factored by `mojopp3d.linalg`.
 """
 
 from __future__ import annotations
@@ -13,8 +13,6 @@ import scipy.sparse
 
 from ._lib import addr, lib
 from ._solver import Factorization
-
-LOG_MAP_STRATEGIES = ("VectorHeat", "AffineLocal", "AffineAdaptive")
 
 
 def _unit(z: np.ndarray) -> np.ndarray:
@@ -33,14 +31,12 @@ class VectorHeatMethodSolver:
         self.n = mesh.n_vertices
 
         # Compute mean edge length and set shortTime, over `mesh.edges()`.
-        total = 0.5 * (geom.edge_lengths.sum() + geom.edge_lengths[mesh.he_twin < 0].sum())
+        total = 0.5 * (geom.edge_lengths.sum() + geom.edge_lengths[mesh.is_boundary_halfedge].sum())
         self.short_time = t_coef * (total / mesh.n_edges) ** 2
 
         self.mass = geom.vertex_dual_areas
         self._vector_solver = None
         self._scalar_solver = None
-        self._poisson_solver = None
-        self._affine_solver = None
         self._connection_laplacian = None
 
     # ---- operators, factored on first use (gc's ensureHave* pattern)
@@ -81,40 +77,6 @@ class VectorHeatMethodSolver:
                 np.concatenate([self.short_time * tim, np.zeros(self.n)]),
             )
         return self._vector_solver
-
-    def _poisson(self) -> Factorization:
-        if self._poisson_solver is None:
-            ti, tj, tv = self.geom.cotan_laplacian_triplets()
-            idx = np.arange(self.n, dtype=np.int64)
-            self._poisson_solver = Factorization(
-                self.n,
-                np.concatenate([ti, idx]),
-                np.concatenate([tj, idx]),
-                np.concatenate([tv, 1.0e-10 * np.ones(self.n)]),
-            )
-        return self._poisson_solver
-
-    def _affine_heat_solver(self) -> Factorization:
-        if self._affine_solver is None:
-            m3 = 3 * self.n
-            cap = 12 * self.mesh.n_he
-            ti = np.zeros(cap, dtype=np.int64)
-            tj = np.zeros(cap, dtype=np.int64)
-            tv = np.zeros(cap, dtype=np.float64)
-            nnz = lib().mpp3d_vector_affine_connection_laplacian(
-                *self.mesh.args(),
-                addr(self.geom.edge_cotan_weights),
-                addr(self.geom.halfedge_vectors_in_vertex),
-                addr(ti), addr(tj), addr(tv),
-            )
-            idx = np.arange(m3, dtype=np.int64)
-            self._affine_solver = Factorization(
-                m3,
-                np.concatenate([ti[:nnz], idx]),
-                np.concatenate([tj[:nnz], idx]),
-                np.concatenate([self.short_time * tv[:nnz], np.repeat(self.mass, 3)]),
-            )
-        return self._affine_solver
 
     # ---- API
 

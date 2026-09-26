@@ -109,6 +109,15 @@ def _():
     )
 
 
+@case("Heat method: construct, robust Laplacian (icosphere, 2562 v)")
+def _():
+    V, F = mesh(4)
+    return (
+        lambda: ours.MeshHeatMethodDistanceSolver(V, F, use_robust=True),
+        lambda: theirs.MeshHeatMethodDistanceSolver(V, F, use_robust=True),
+    )
+
+
 @case("Vector heat: construct (icosphere, 2562 v)")
 def _():
     V, F = mesh(5)
@@ -184,6 +193,43 @@ def _():
     )
 
 
+@functools.lru_cache(maxsize=None)
+def cloud(n: int):
+    rng = np.random.default_rng(0)
+    v = rng.normal(size=(n, 3))
+    v /= np.linalg.norm(v, axis=1, keepdims=True)
+    return np.ascontiguousarray(v)
+
+
+@case("Point cloud: local triangulation (2000 points)")
+def _():
+    P = cloud(2000)
+    return (
+        lambda: ours.PointCloudLocalTriangulation(P, True).get_local_triangulation(),
+        lambda: theirs.PointCloudLocalTriangulation(P, True).get_local_triangulation(),
+    )
+
+
+@case("Point cloud: construct (2000 points)")
+def _():
+    P = cloud(2000)
+    return (
+        lambda: ours.PointCloudHeatSolver(P),
+        lambda: theirs.PointCloudHeatSolver(P),
+    )
+
+
+@case("Point cloud: 1 distance query (2000 points)")
+def _():
+    P = cloud(2000)
+    a = ours.PointCloudHeatSolver(P)
+    b = theirs.PointCloudHeatSolver(P)
+    return (
+        lambda: a.compute_distance(0),
+        lambda: b.compute_distance(0),
+    )
+
+
 def main() -> None:
     print(f"machine: {platform.platform()}", flush=True)
     print(f"python:  {platform.python_version()}  numpy: {np.__version__}")
@@ -192,7 +238,7 @@ def main() -> None:
     print("| --- | ---: | ---: | ---: |")
     for name, maker in CASES:
         f_ours, f_theirs = maker()
-        repeat = 1 if "10242" in name else 3
+        repeat = 1 if "10242" in name or "2000 points" in name else 3
         f_ours()  # warm the library build and any lazy imports
         t_ours = timeit(f_ours, repeat)
         t_theirs = timeit(f_theirs, repeat)

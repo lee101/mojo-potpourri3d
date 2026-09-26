@@ -78,11 +78,12 @@ def mpp3d_build_halfedge_mesh(
     tmpk: Int,
     tmpv: Int,
     count: Int,
-) abi("C"):
-    build_halfedge_mesh(
+    twin_in: Int,
+) abi("C") -> Int:
+    return build_halfedge_mesh(
         ip(F), n_faces, n_vertices, ip(he_vertex), ip(he_next), ip(he_twin),
         ip(he_face), ip(v_halfedge), ip(f_halfedge), ip(keys), ip(vals), ip(tmpk),
-        ip(tmpv), ip(count),
+        ip(tmpv), ip(count), twin_in,
     )
 
 
@@ -300,12 +301,14 @@ def mpp3d_rcm(n: Int, Ap: Int, Ai: Int, degree: Int, visited: Int, queue: Int, o
 @export("mpp3d_permute_upper")
 def mpp3d_permute_upper(
     n: Int, ti: Int, tj: Int, txr: Int, txi: Int, nnzT: Int,
-    degree: Int, visited: Int, queue: Int, perm: Int, iperm: Int, count: Int,
+    degree: Int, visited: Int, queue: Int, perm: Int, iperm: Int,
     Ap: Int, Ai: Int, Axr: Int, Axi: Int, ApNew: Int,
+    keys: Int, aux: Int, keybuf: Int, auxbuf: Int,
 ) abi("C") -> Int:
     return permute_upper(
         n, ip(ti), ip(tj), fp(txr), fp(txi), nnzT, ip(degree), ip(visited), ip(queue),
-        ip(perm), ip(iperm), ip(count), ip(Ap), ip(Ai), fp(Axr), fp(Axi), ip(ApNew),
+        ip(perm), ip(iperm), ip(Ap), ip(Ai), fp(Axr), fp(Axi), ip(ApNew),
+        ip(keys), ip(aux), ip(keybuf), ip(auxbuf),
     )
 
 
@@ -482,4 +485,253 @@ def mpp3d_vector_transport_rhs(
     transport_rhs(
         mesh(he_vertex, he_next, he_twin, he_face, v_halfedge, f_halfedge, n_he, n_vertices, n_faces),
         ip(sources), fp(vectors), n_sources, fp(rhs_re), fp(rhs_im),
+    )
+
+
+# ------------------------------------------- general mesh / tufted cover / flips
+
+from mojopp3d.general_mesh import (
+    GenMesh,
+    build_general_mesh,
+    duplicate_face as gen_duplicate_face,
+    invert_orientation as gen_invert_orientation,
+    separate_to_new_edge as gen_separate_to_new_edge,
+    flip as gen_flip,
+    write_faces,
+    write_halfedge_edge_lengths,
+    write_twins,
+)
+from mojopp3d.tufted import (
+    build_intrinsic_tufted_cover,
+    flip_to_delaunay,
+    mollify_intrinsic,
+)
+
+
+def gmesh(
+    he_vertex: Int, he_next: Int, he_face: Int, he_edge: Int, he_orient: Int,
+    he_sibling: Int, e_halfedge: Int, f_halfedge: Int, counts: Int,
+) -> GenMesh:
+    return GenMesh(
+        he_vertex, he_next, he_face, he_edge, he_orient, he_sibling,
+        e_halfedge, f_halfedge, counts,
+    )
+
+
+@export("mpp3d_build_general_mesh")
+def mpp3d_build_general_mesh(
+    F: Int, n_faces: Int, n_vertices: Int, he_vertex: Int, he_next: Int,
+    he_face: Int, he_edge: Int, he_orient: Int, he_sibling: Int,
+    e_halfedge: Int, f_halfedge: Int, counts: Int, keys: Int, vals: Int,
+    tmpk: Int, tmpv: Int, bucket: Int,
+) abi("C"):
+    build_general_mesh(
+        ip(F), n_faces, n_vertices,
+        gmesh(
+            he_vertex, he_next, he_face, he_edge, he_orient, he_sibling,
+            e_halfedge, f_halfedge, counts,
+        ),
+        ip(keys), ip(vals), ip(tmpk), ip(tmpv), ip(bucket),
+    )
+
+
+@export("mpp3d_general_write_faces")
+def mpp3d_general_write_faces(
+    he_vertex: Int, he_next: Int, he_face: Int, he_edge: Int, he_orient: Int,
+    he_sibling: Int, e_halfedge: Int, f_halfedge: Int, counts: Int, F: Int,
+) abi("C"):
+    write_faces(
+        gmesh(
+            he_vertex, he_next, he_face, he_edge, he_orient, he_sibling,
+            e_halfedge, f_halfedge, counts,
+        ),
+        ip(F),
+    )
+
+
+@export("mpp3d_general_duplicate_face")
+def mpp3d_general_duplicate_face(
+    he_vertex: Int, he_next: Int, he_face: Int, he_edge: Int, he_orient: Int,
+    he_sibling: Int, e_halfedge: Int, f_halfedge: Int, counts: Int, f: Int,
+) abi("C") -> Int:
+    return gen_duplicate_face(
+        gmesh(
+            he_vertex, he_next, he_face, he_edge, he_orient, he_sibling,
+            e_halfedge, f_halfedge, counts,
+        ),
+        f,
+    )
+
+
+@export("mpp3d_general_invert_orientation")
+def mpp3d_general_invert_orientation(
+    he_vertex: Int, he_next: Int, he_face: Int, he_edge: Int, he_orient: Int,
+    he_sibling: Int, e_halfedge: Int, f_halfedge: Int, counts: Int, f: Int,
+) abi("C"):
+    gen_invert_orientation(
+        gmesh(
+            he_vertex, he_next, he_face, he_edge, he_orient, he_sibling,
+            e_halfedge, f_halfedge, counts,
+        ),
+        f,
+    )
+
+
+@export("mpp3d_general_separate_to_new_edge")
+def mpp3d_general_separate_to_new_edge(
+    he_vertex: Int, he_next: Int, he_face: Int, he_edge: Int, he_orient: Int,
+    he_sibling: Int, e_halfedge: Int, f_halfedge: Int, counts: Int,
+    he_a: Int, he_b: Int,
+) abi("C") -> Int:
+    return gen_separate_to_new_edge(
+        gmesh(
+            he_vertex, he_next, he_face, he_edge, he_orient, he_sibling,
+            e_halfedge, f_halfedge, counts,
+        ),
+        he_a, he_b,
+    )
+
+
+@export("mpp3d_general_flip")
+def mpp3d_general_flip(
+    he_vertex: Int, he_next: Int, he_face: Int, he_edge: Int, he_orient: Int,
+    he_sibling: Int, e_halfedge: Int, f_halfedge: Int, counts: Int, e: Int,
+) abi("C") -> Int:
+    if gen_flip(
+        gmesh(
+            he_vertex, he_next, he_face, he_edge, he_orient, he_sibling,
+            e_halfedge, f_halfedge, counts,
+        ),
+        e,
+    ):
+        return 1
+    return 0
+
+
+@export("mpp3d_mollify_intrinsic")
+def mpp3d_mollify_intrinsic(
+    he_vertex: Int, he_next: Int, he_face: Int, he_edge: Int, he_orient: Int,
+    he_sibling: Int, e_halfedge: Int, f_halfedge: Int, counts: Int,
+    edge_lengths: Int, n_edges: Int, relative_factor: Float64,
+) abi("C") -> Float64:
+    return mollify_intrinsic(
+        gmesh(
+            he_vertex, he_next, he_face, he_edge, he_orient, he_sibling,
+            e_halfedge, f_halfedge, counts,
+        ),
+        fp(edge_lengths), n_edges, relative_factor,
+    )
+
+
+@export("mpp3d_build_intrinsic_tufted_cover")
+def mpp3d_build_intrinsic_tufted_cover(
+    he_vertex: Int, he_next: Int, he_face: Int, he_edge: Int, he_orient: Int,
+    he_sibling: Int, e_halfedge: Int, f_halfedge: Int, counts: Int,
+    edge_lengths: Int, n_orig_faces: Int, n_orig_edges: Int, other_sheet: Int,
+    is_front: Int, is_orig_edge: Int, edge_faces: Int, max_faces: Int,
+    max_he: Int, max_edges: Int,
+) abi("C") -> Int:
+    return build_intrinsic_tufted_cover(
+        gmesh(
+            he_vertex, he_next, he_face, he_edge, he_orient, he_sibling,
+            e_halfedge, f_halfedge, counts,
+        ),
+        fp(edge_lengths), n_orig_faces, n_orig_edges, ip(other_sheet),
+        ip(is_front), ip(is_orig_edge), ip(edge_faces), max_faces, max_he,
+        max_edges,
+    )
+
+
+@export("mpp3d_flip_to_delaunay")
+def mpp3d_flip_to_delaunay(
+    he_vertex: Int, he_next: Int, he_face: Int, he_edge: Int, he_orient: Int,
+    he_sibling: Int, e_halfedge: Int, f_halfedge: Int, counts: Int,
+    edge_lengths: Int, n_edges: Int, queue: Int, in_queue: Int,
+    queue_cap: Int, delaunay_eps: Float64,
+) abi("C") -> Int:
+    return flip_to_delaunay(
+        gmesh(
+            he_vertex, he_next, he_face, he_edge, he_orient, he_sibling,
+            e_halfedge, f_halfedge, counts,
+        ),
+        fp(edge_lengths), n_edges, ip(queue), ip(in_queue), queue_cap,
+        delaunay_eps,
+    )
+
+
+@export("mpp3d_general_write_twins")
+def mpp3d_general_write_twins(
+    he_vertex: Int, he_next: Int, he_face: Int, he_edge: Int, he_orient: Int,
+    he_sibling: Int, e_halfedge: Int, f_halfedge: Int, counts: Int,
+    twins: Int, index_of: Int,
+) abi("C"):
+    write_twins(
+        gmesh(
+            he_vertex, he_next, he_face, he_edge, he_orient, he_sibling,
+            e_halfedge, f_halfedge, counts,
+        ),
+        ip(twins), ip(index_of),
+    )
+
+
+@export("mpp3d_general_write_halfedge_edge_lengths")
+def mpp3d_general_write_halfedge_edge_lengths(
+    he_vertex: Int, he_next: Int, he_face: Int, he_edge: Int, he_orient: Int,
+    he_sibling: Int, e_halfedge: Int, f_halfedge: Int, counts: Int,
+    edge_lengths: Int, dst: Int,
+) abi("C"):
+    write_halfedge_edge_lengths(
+        gmesh(
+            he_vertex, he_next, he_face, he_edge, he_orient, he_sibling,
+            e_halfedge, f_halfedge, counts,
+        ),
+        fp(edge_lengths), fp(dst),
+    )
+
+
+# ------------------------------------------------ point cloud local triangulation
+
+from mojopp3d.local_triangulation import (
+    build_local_triangulations,
+    compute_neighbors,
+    compute_normals,
+    compute_tangent_coordinates,
+)
+
+
+@export("mpp3d_pc_neighbors")
+def mpp3d_pc_neighbors(
+    points: Int, n: Int, k: Int, neighbors: Int, keys: Int, vals: Int,
+) abi("C"):
+    compute_neighbors(
+        fp(points), n, k, ip(neighbors), fp(keys), ip(vals)
+    )
+
+
+@export("mpp3d_pc_normals")
+def mpp3d_pc_normals(
+    points: Int, neighbors: Int, n: Int, k: Int, normals: Int, a: Int, v: Int,
+) abi("C"):
+    compute_normals(
+        fp(points), ip(neighbors), n, k, fp(normals), fp(a), fp(v)
+    )
+
+
+@export("mpp3d_pc_tangent_coordinates")
+def mpp3d_pc_tangent_coordinates(
+    points: Int, normals: Int, neighbors: Int, n: Int, k: Int, coords: Int,
+) abi("C"):
+    compute_tangent_coordinates(
+        fp(points), fp(normals), ip(neighbors), n, k, fp(coords)
+    )
+
+
+@export("mpp3d_pc_local_triangulation")
+def mpp3d_pc_local_triangulation(
+    coords: Int, neighbors: Int, n: Int, k: Int, heuristic: Int, tri: Int,
+    offsets: Int, pts: Int, angles: Int, sort_inds: Int,
+) abi("C") -> Int:
+    return build_local_triangulations(
+        fp(coords), ip(neighbors), n, k, heuristic, ip(tri), ip(offsets),
+        fp(pts), fp(angles), ip(sort_inds),
     )

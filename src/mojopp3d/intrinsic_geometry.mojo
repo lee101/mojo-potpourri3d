@@ -78,7 +78,10 @@ def compute_vertex_angle_sums(
 
 
 # Corner scaled angles (computeCornerScaledAngles). Rescale the cone angles so
-# they wrap exactly once around each vertex.
+# they wrap exactly once around each vertex. gc branches on the *vertex's*
+# boundary flag, so every corner of a boundary vertex scales to pi -- testing
+# the corner's own predecessor halfedge instead would leave the interior
+# corners of a valence-3 boundary vertex scaled to 2*pi.
 def compute_corner_scaled_angles(
     mesh: HalfedgeMesh,
     corner_angles: Ptr,
@@ -87,13 +90,28 @@ def compute_corner_scaled_angles(
 ):
     for he in range(mesh.n_he):
         var v = mesh.vertex(he)
-        var hePrev = mesh.twin(mesh.next(mesh.next(he)))
-        if hePrev < 0:
-            var s = PI / vertex_angle_sums.unsafe_load(v)
-            corner_scaled_angles.unsafe_store(he, s * corner_angles.unsafe_load(he))
-        else:
-            var s = 2.0 * PI / vertex_angle_sums.unsafe_load(v)
-            corner_scaled_angles.unsafe_store(he, s * corner_angles.unsafe_load(he))
+        var s = 2.0 * PI / vertex_angle_sums.unsafe_load(v)
+        if _vertex_is_boundary(mesh, v):
+            s = PI / vertex_angle_sums.unsafe_load(v)
+        corner_scaled_angles.unsafe_store(he, s * corner_angles.unsafe_load(he))
+
+
+# gc's `Vertex::isBoundary()`: a vertex is a boundary vertex when any halfedge
+# in its 1-ring is its own twin. gc's `computeHalfedgeVectorsInVertex` does not
+# stop at a boundary halfedge -- `Halfedge::isInterior()` there tests the
+# *face* against the boundary loops, which a face soup has none of -- so its
+# 1-ring walk closes on the implicit twin, and so must this one.
+def _vertex_is_boundary(mesh: HalfedgeMesh, v: Int) -> Bool:
+    var first_he = mesh.first_outgoing(v)
+    if first_he < 0:
+        return False
+    var curr_he = first_he
+    while True:
+        if mesh.is_boundary(curr_he):
+            return True
+        curr_he = mesh.twin(mesh.next(mesh.next(curr_he)))
+        if curr_he == first_he:
+            return False
 
 
 # Halfedge cotan weights (computeHalfedgeCotanWeights). Every halfedge here
@@ -127,7 +145,7 @@ def compute_edge_cotan_weights(
         var cotSum = cotValue / 2.0
 
         var twin = mesh.twin(he)
-        if twin >= 0:
+        if twin != he:
             var l2_ij = edge_lengths.unsafe_load(twin)
             var l2_jk = edge_lengths.unsafe_load(mesh.next(twin))
             var l2_ki = edge_lengths.unsafe_load(mesh.next(mesh.next(twin)))
@@ -200,11 +218,7 @@ def compute_halfedge_vectors_in_vertex(
             halfedge_vec.unsafe_store(2 * curr_he, dir.x * len)
             halfedge_vec.unsafe_store(2 * curr_he + 1, dir.y * len)
             coord_sum += corner_scaled_angles.unsafe_load(curr_he)
-            if not mesh.is_interior(curr_he):
-                break
             curr_he = mesh.twin(mesh.next(mesh.next(curr_he)))
-            if curr_he < 0:
-                break
             if curr_he == first_he:
                 break
 
@@ -216,7 +230,11 @@ def compute_transport_vectors_along_halfedge(
 ):
     for he in range(mesh.n_he):
         var twin = mesh.twin(he)
-        if twin < 0:
+        if twin == he:
+            # gc iterates over edges, so a boundary edge is its own twin and
+            # `unit(-vecB / vecA)` with vecB == vecA is exactly -1.
+            transport.unsafe_store(2 * he, -1.0)
+            transport.unsafe_store(2 * he + 1, 0.0)
             continue
         if he > twin:
             continue
@@ -280,8 +298,6 @@ def compute_vertex_connection_laplacian(
 
         var weight = edge_cotan_weights.unsafe_load(he)
         var twin = mesh.twin(he)
-        if twin < 0:
-            continue
         var rot = Vec2(transport.unsafe_load(2 * twin), transport.unsafe_load(2 * twin + 1))
 
         tri_i.unsafe_store(Int64(n), Int64(i_tail))

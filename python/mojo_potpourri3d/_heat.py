@@ -26,7 +26,7 @@ class HeatMethodDistanceSolver:
         # Compute mean edge length and set shortTime. gc averages over
         # `mesh.edges()`; the halfedge buffer counts interior edges twice, so
         # the boundary sum is added back before halving.
-        boundary = geom.edge_lengths[mesh.he_twin < 0].sum()
+        boundary = geom.edge_lengths[mesh.is_boundary_halfedge].sum()
         total = 0.5 * (geom.edge_lengths.sum() + boundary)
         mean_edge_length = total / mesh.n_edges
         self.short_time = t_coef * mean_edge_length * mean_edge_length

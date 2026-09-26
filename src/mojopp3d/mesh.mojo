@@ -85,14 +85,14 @@ struct HalfedgeMesh:
     def first_halfedge(self, f: Int) -> Int:
         return Int(self.ifh().unsafe_load(Int64(f)))
 
-    def first_outgoing(self, v: Int) -> Int:
-        return Int(self.ivh().unsafe_load(Int64(v)))
-
+    # gc's implicit twin: a boundary halfedge is its own twin, which is what
+    # makes the 1-ring walks below close into a cycle instead of running off
+    # the end of the fan.
     def is_interior(self, he: Int) -> Bool:
-        return Int(self.itw().unsafe_load(Int64(he))) >= 0
+        return self.twin(he) != he
 
     def is_boundary(self, he: Int) -> Bool:
-        return Int(self.itw().unsafe_load(Int64(he))) < 0
+        return self.twin(he) == he
 
 
 # LSD radix sort of (key, value) pairs, 8 bits at a time. Eight passes is an
@@ -138,7 +138,8 @@ def build_halfedge_mesh(
     tmpk: IPtr,
     tmpv: IPtr,
     count: IPtr,
-):
+    twin_in: Int,
+) -> Int:
     var n_he = 3 * n_faces
     for v in range(n_vertices):
         v_halfedge.unsafe_store(Int64(v), Int64(-1))
@@ -152,6 +153,19 @@ def build_halfedge_mesh(
         f_halfedge.unsafe_store(Int64(f), Int64(3 * f))
         # Written unconditionally, so the last outgoing halfedge wins.
         v_halfedge.unsafe_store(v, Int64(he))
+
+    # A mesh that came out of the tufted cover already knows its twins, and
+    # parallel edges there make the vertex-pair matching below ambiguous, so
+    # take them as given when the caller has them. `writeTwins` spells a
+    # boundary halfedge as -1; the implicit twin here is the halfedge itself.
+    if twin_in != 0:
+        var src = IPtr(unsafe_from_address=twin_in)
+        for he in range(n_he):
+            var t = src.unsafe_load(Int64(he))
+            if t < 0:
+                t = Int64(he)
+            he_twin.unsafe_store(Int64(he), t)
+        return Int(0)
 
     # Match halfedges to twins. Key on the *unordered* vertex pair, so the two
     # orientations of an edge land next to each other after the sort.
@@ -169,7 +183,7 @@ def build_halfedge_mesh(
     radix_sort_pairs(keys, vals, tmpk, tmpv, count, n_he)
 
     for he in range(n_he):
-        he_twin.unsafe_store(Int64(he), Int64(-1))
+        he_twin.unsafe_store(Int64(he), Int64(he))
     var p = 0
     while p < n_he:
         var q = p + 1
@@ -177,11 +191,15 @@ def build_halfedge_mesh(
             if keys.unsafe_load(Int64(q)) != keys.unsafe_load(Int64(p)):
                 break
             q += 1
-        # A directed edge is unique in a valid manifold triangulation, so each
-        # group is a lone boundary halfedge or a matched interior pair.
-        var a = p
-        while a + 1 < q:
-            he_twin.unsafe_store(vals.unsafe_load(Int64(a)), vals.unsafe_load(Int64(a + 1)))
-            he_twin.unsafe_store(vals.unsafe_load(Int64(a + 1)), vals.unsafe_load(Int64(a)))
-            a += 2
+        # gc links every halfedge on the pair into a sibling cycle, so a
+        # non-manifold edge is representable there and only there. This mesh
+        # stores one twin per halfedge, which cannot express a cycle of three
+        # or more; reject that input rather than leave the odd halfedge out
+        # and read it as a boundary.
+        if q - p > 2:
+            return -Int(1)
+        if q - p == 2:
+            he_twin.unsafe_store(vals.unsafe_load(Int64(p)), vals.unsafe_load(Int64(p + Int(1))))
+            he_twin.unsafe_store(vals.unsafe_load(Int64(p + Int(1))), vals.unsafe_load(Int64(p)))
         p = q
+    return Int(0)

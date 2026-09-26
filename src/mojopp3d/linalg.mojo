@@ -26,8 +26,15 @@ order the caller chose. Index arrays are Int64 to match what crosses the FFI,
 so every offset below is Int64 as well.
 """
 
+from std.sys import simd_width_of
+
 comptime Ptr = Pointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = Pointer[Int64, AnyOrigin[mut=True]]
+
+# The vector gather/scatter intrinsics are microcoded on this target and lose
+# to four independent scalar accesses issued back to back, so the sparse inner
+# loops batch by hand. The elementwise passes do go through the registers.
+comptime W = simd_width_of[DType.float64]()
 
 # A single complex-symmetric factor entry. The real kernels work on bare
 # Float64 so their hot loops stay vectorizable.
@@ -317,12 +324,12 @@ def ldl_numeric(
     W: Ptr,
 ):
     var m = Int64(n)
-    for p in range(Int64(nnzL)):
-        Lx.unsafe_store(p, 0.0)
+    # Lx needs no pre-zeroing: column k is written in full before any later
+    # column reads it, so every entry is live before it is read.
     for i in range(m):
         Y.unsafe_store(i, 0.0)
-        D.unsafe_store(i, 0.0)
         upto.unsafe_store(i, S_p.unsafe_load(i))
+
     for k in range(m):
         # Row k of L is the list of `j < k` this column is built from, and it
         # carries the offset of each L(k,j) in the column-compressed values.
@@ -332,6 +339,25 @@ def ldl_numeric(
         # D(k) = A(k,k) - sum_j L(k,j)^2 D(j)
         var dsum = 0.0
         var q = rp
+        while q + Int64(4) <= re:
+            var k0 = R_pos.unsafe_load(q)
+            var k1 = R_pos.unsafe_load(q + Int64(1))
+            var k2 = R_pos.unsafe_load(q + Int64(2))
+            var k3 = R_pos.unsafe_load(q + Int64(3))
+            var l0 = Lx.unsafe_load(k0)
+            var l1 = Lx.unsafe_load(k1)
+            var l2 = Lx.unsafe_load(k2)
+            var l3 = Lx.unsafe_load(k3)
+            var w0 = l0 * D.unsafe_load(R_i.unsafe_load(q))
+            var w1 = l1 * D.unsafe_load(R_i.unsafe_load(q + Int64(1)))
+            var w2 = l2 * D.unsafe_load(R_i.unsafe_load(q + Int64(2)))
+            var w3 = l3 * D.unsafe_load(R_i.unsafe_load(q + Int64(3)))
+            W.unsafe_store(q - rp, w0)
+            W.unsafe_store(q - rp + Int64(1), w1)
+            W.unsafe_store(q - rp + Int64(2), w2)
+            W.unsafe_store(q - rp + Int64(3), w3)
+            dsum += (w0 * l0 + w1 * l1) + (w2 * l2 + w3 * l3)
+            q += Int64(4)
         while q < re:
             var lkj = Lx.unsafe_load(R_pos.unsafe_load(q))
             var w = lkj * D.unsafe_load(R_i.unsafe_load(q))
@@ -364,6 +390,20 @@ def ldl_numeric(
             while r < je and S_i.unsafe_load(r) <= k:
                 r += Int64(1)
             upto.unsafe_store(j, r)
+            while r + Int64(4) <= je:
+                var i0 = S_i.unsafe_load(r)
+                var i1 = S_i.unsafe_load(r + Int64(1))
+                var i2 = S_i.unsafe_load(r + Int64(2))
+                var i3 = S_i.unsafe_load(r + Int64(3))
+                var v0 = Y.unsafe_load(i0)
+                var v1 = Y.unsafe_load(i1)
+                var v2 = Y.unsafe_load(i2)
+                var v3 = Y.unsafe_load(i3)
+                Y.unsafe_store(i0, v0 - Lx.unsafe_load(r) * w)
+                Y.unsafe_store(i1, v1 - Lx.unsafe_load(r + Int64(1)) * w)
+                Y.unsafe_store(i2, v2 - Lx.unsafe_load(r + Int64(2)) * w)
+                Y.unsafe_store(i3, v3 - Lx.unsafe_load(r + Int64(3)) * w)
+                r += Int64(4)
             while r < je:
                 var i = S_i.unsafe_load(r)
                 Y.unsafe_store(i, Y.unsafe_load(i) - Lx.unsafe_load(r) * w)
@@ -392,22 +432,78 @@ def ldl_numeric(
 def ldl_solve(n: Int, S_p: IPtr, S_i: IPtr, Lx: Ptr, D: Ptr, B: Ptr, X: Ptr, nrhs: Int):
     """In-place solve of A X = B, `nrhs` right-hand sides, one per column."""
     # B and X are `n x nrhs` in C order, i.e. right-hand side r starts at r.
+    # The two sparse passes are batches of four rather than one-at-a-time: a
+    # vector gather/scatter is microcoded on this target and slower, but four
+    # independent scalar accesses issued back to back do overlap.
     var m = Int64(n)
     var stride = Int64(nrhs)
     for r in range(Int64(nrhs)):
-        for k in range(m):
-            X.unsafe_store(k * stride + r, B.unsafe_load(k * stride + r))
+        # X = B, and w = D^-1 y below, are elementwise in k. They are only
+        # contiguous in memory for a single right-hand side.
+        var kk = Int64(0)
+        if stride == Int64(1):
+            while kk + Int64(W) <= m:
+                X.unsafe_store[width=W](kk, B.unsafe_load[width=W](kk))
+                kk += Int64(W)
+        while kk < m:
+            X.unsafe_store(kk * stride + r, B.unsafe_load(kk * stride + r))
+            kk += Int64(1)
         for k in range(m):  # L y = b
             var xk = X.unsafe_load(k * stride + r)
-            for p in range(S_p.unsafe_load(k), S_p.unsafe_load(k + 1)):
+            var p = S_p.unsafe_load(k)
+            var pe = S_p.unsafe_load(k + Int64(1))
+            while p + Int64(4) <= pe:
+                var i0 = S_i.unsafe_load(p) * stride + r
+                var i1 = S_i.unsafe_load(p + Int64(1)) * stride + r
+                var i2 = S_i.unsafe_load(p + Int64(2)) * stride + r
+                var i3 = S_i.unsafe_load(p + Int64(3)) * stride + r
+                var v0 = X.unsafe_load(i0)
+                var v1 = X.unsafe_load(i1)
+                var v2 = X.unsafe_load(i2)
+                var v3 = X.unsafe_load(i3)
+                X.unsafe_store(i0, v0 - Lx.unsafe_load(p) * xk)
+                X.unsafe_store(i1, v1 - Lx.unsafe_load(p + Int64(1)) * xk)
+                X.unsafe_store(i2, v2 - Lx.unsafe_load(p + Int64(2)) * xk)
+                X.unsafe_store(i3, v3 - Lx.unsafe_load(p + Int64(3)) * xk)
+                p += Int64(4)
+            while p < pe:
                 var idx = S_i.unsafe_load(p) * stride + r
                 X.unsafe_store(idx, X.unsafe_load(idx) - Lx.unsafe_load(p) * xk)
-        for k in range(m):  # w = D^-1 y
-            X.unsafe_store(k * stride + r, X.unsafe_load(k * stride + r) / D.unsafe_load(k))
+                p += Int64(1)
+        kk = Int64(0)
+        if stride == Int64(1):
+            while kk + Int64(W) <= m:  # w = D^-1 y
+                X.unsafe_store[width=W](
+                    kk, X.unsafe_load[width=W](kk) / D.unsafe_load[width=W](kk)
+                )
+                kk += Int64(W)
+        while kk < m:
+            var idx = kk * stride + r
+            X.unsafe_store(idx, X.unsafe_load(idx) / D.unsafe_load(kk))
+            kk += Int64(1)
         for k in range(m - Int64(1), Int64(-1), Int64(-1)):  # L^T z = w
-            var acc = X.unsafe_load(k * stride + r)
-            for p in range(S_p.unsafe_load(k), S_p.unsafe_load(k + 1)):
+            var p = S_p.unsafe_load(k)
+            var pe = S_p.unsafe_load(k + Int64(1))
+            var a0 = 0.0
+            var a1 = 0.0
+            var a2 = 0.0
+            var a3 = 0.0
+            while p + Int64(4) <= pe:
+                a0 += Lx.unsafe_load(p) * X.unsafe_load(S_i.unsafe_load(p) * stride + r)
+                a1 += Lx.unsafe_load(p + Int64(1)) * X.unsafe_load(
+                    S_i.unsafe_load(p + Int64(1)) * stride + r
+                )
+                a2 += Lx.unsafe_load(p + Int64(2)) * X.unsafe_load(
+                    S_i.unsafe_load(p + Int64(2)) * stride + r
+                )
+                a3 += Lx.unsafe_load(p + Int64(3)) * X.unsafe_load(
+                    S_i.unsafe_load(p + Int64(3)) * stride + r
+                )
+                p += Int64(4)
+            var acc = X.unsafe_load(k * stride + r) - ((a0 + a1) + (a2 + a3))
+            while p < pe:
                 acc -= Lx.unsafe_load(p) * X.unsafe_load(S_i.unsafe_load(p) * stride + r)
+                p += Int64(1)
             X.unsafe_store(k * stride + r, acc)
 
 
@@ -539,32 +635,98 @@ def ldl_solve_c(
     var m = Int64(n)
     for r in range(Int64(nrhs)):
         var off = r * m
-        for k in range(m):
-            Xr.unsafe_store(off + k, Br.unsafe_load(off + k))
-            Xi.unsafe_store(off + k, Bi.unsafe_load(off + k))
+        var t = Int64(0)
+        while t + Int64(W) <= m:  # X = B
+            Xr.unsafe_store[width=W](off + t, Br.unsafe_load[width=W](off + t))
+            Xi.unsafe_store[width=W](off + t, Bi.unsafe_load[width=W](off + t))
+            t += Int64(W)
+        while t < m:
+            Xr.unsafe_store(off + t, Br.unsafe_load(off + t))
+            Xi.unsafe_store(off + t, Bi.unsafe_load(off + t))
+            t += Int64(1)
         for k in range(m):  # L y = b
             var yk = Cplx(Xr.unsafe_load(off + k), Xi.unsafe_load(off + k))
-            for p in range(S_p.unsafe_load(k), S_p.unsafe_load(k + 1)):
-                var t = Cplx(Lxr.unsafe_load(p), Lxi.unsafe_load(p))
+            var p = S_p.unsafe_load(k)
+            var pe = S_p.unsafe_load(k + Int64(1))
+            while p + Int64(4) <= pe:
+                var i0 = off + S_i.unsafe_load(p)
+                var i1 = off + S_i.unsafe_load(p + Int64(1))
+                var i2 = off + S_i.unsafe_load(p + Int64(2))
+                var i3 = off + S_i.unsafe_load(p + Int64(3))
+                var v0 = Cplx(Xr.unsafe_load(i0), Xi.unsafe_load(i0))
+                var v1 = Cplx(Xr.unsafe_load(i1), Xi.unsafe_load(i1))
+                var v2 = Cplx(Xr.unsafe_load(i2), Xi.unsafe_load(i2))
+                var v3 = Cplx(Xr.unsafe_load(i3), Xi.unsafe_load(i3))
+                v0 = v0 - Cplx(Lxr.unsafe_load(p), Lxi.unsafe_load(p)) * yk
+                v1 = v1 - Cplx(Lxr.unsafe_load(p + Int64(1)), Lxi.unsafe_load(p + Int64(1))) * yk
+                v2 = v2 - Cplx(Lxr.unsafe_load(p + Int64(2)), Lxi.unsafe_load(p + Int64(2))) * yk
+                v3 = v3 - Cplx(Lxr.unsafe_load(p + Int64(3)), Lxi.unsafe_load(p + Int64(3))) * yk
+                Xr.unsafe_store(i0, v0.re)
+                Xi.unsafe_store(i0, v0.im)
+                Xr.unsafe_store(i1, v1.re)
+                Xi.unsafe_store(i1, v1.im)
+                Xr.unsafe_store(i2, v2.re)
+                Xi.unsafe_store(i2, v2.im)
+                Xr.unsafe_store(i3, v3.re)
+                Xi.unsafe_store(i3, v3.im)
+                p += Int64(4)
+            while p < pe:
+                var tv = Cplx(Lxr.unsafe_load(p), Lxi.unsafe_load(p))
                 var idx = off + S_i.unsafe_load(p)
                 var xv = Cplx(Xr.unsafe_load(idx), Xi.unsafe_load(idx))
-                var upd = xv - t * yk
+                var upd = xv - tv * yk
                 Xr.unsafe_store(idx, upd.re)
                 Xi.unsafe_store(idx, upd.im)
+                p += Int64(1)
             Xr.unsafe_store(off + k, yk.re)
             Xi.unsafe_store(off + k, yk.im)
-        for k in range(m):  # w = D^-1 y, D is real
-            var wv = Cplx(Xr.unsafe_load(off + k), Xi.unsafe_load(off + k)) / Cplx(
-                Dr.unsafe_load(k), 0.0
-            )
-            Xr.unsafe_store(off + k, wv.re)
-            Xi.unsafe_store(off + k, wv.im)
+        t = Int64(0)
+        while t + Int64(W) <= m:  # w = D^-1 y, D is real
+            Xr.unsafe_store[width=W](off + t, Xr.unsafe_load[width=W](off + t) / Dr.unsafe_load[width=W](t))
+            Xi.unsafe_store[width=W](off + t, Xi.unsafe_load[width=W](off + t) / Dr.unsafe_load[width=W](t))
+            t += Int64(W)
+        while t < m:
+            var d = Dr.unsafe_load(t)
+            Xr.unsafe_store(off + t, Xr.unsafe_load(off + t) / d)
+            Xi.unsafe_store(off + t, Xi.unsafe_load(off + t) / d)
+            t += Int64(1)
         for k in range(m - Int64(1), Int64(-1), Int64(-1)):  # L^H z = w
-            var acc = Cplx(Xr.unsafe_load(off + k), Xi.unsafe_load(off + k))
-            for p in range(S_p.unsafe_load(k), S_p.unsafe_load(k + 1)):
-                var t = Cplx(Lxr.unsafe_load(p), Lxi.unsafe_load(p))
+            var p = S_p.unsafe_load(k)
+            var pe = S_p.unsafe_load(k + Int64(1))
+            var ar0 = 0.0
+            var ai0 = 0.0
+            var ar1 = 0.0
+            var ai1 = 0.0
+            while p + Int64(4) <= pe:
+                var q0 = off + S_i.unsafe_load(p)
+                var q1 = off + S_i.unsafe_load(p + Int64(1))
+                var q2 = off + S_i.unsafe_load(p + Int64(2))
+                var q3 = off + S_i.unsafe_load(p + Int64(3))
+                var t0 = Cplx(Lxr.unsafe_load(p), Lxi.unsafe_load(p))
+                var t1 = Cplx(Lxr.unsafe_load(p + Int64(1)), Lxi.unsafe_load(p + Int64(1)))
+                var t2 = Cplx(Lxr.unsafe_load(p + Int64(2)), Lxi.unsafe_load(p + Int64(2)))
+                var t3 = Cplx(Lxr.unsafe_load(p + Int64(3)), Lxi.unsafe_load(p + Int64(3)))
+                var u0 = Cplx(Xr.unsafe_load(q0), Xi.unsafe_load(q0))
+                var u1 = Cplx(Xr.unsafe_load(q1), Xi.unsafe_load(q1))
+                var u2 = Cplx(Xr.unsafe_load(q2), Xi.unsafe_load(q2))
+                var u3 = Cplx(Xr.unsafe_load(q3), Xi.unsafe_load(q3))
+                ar0 += t0.re * u0.re + t0.im * u0.im
+                ai0 += t0.re * u0.im - t0.im * u0.re
+                ar1 += t1.re * u1.re + t1.im * u1.im
+                ai1 += t1.re * u1.im - t1.im * u1.re
+                ar0 += t2.re * u2.re + t2.im * u2.im
+                ai0 += t2.re * u2.im - t2.im * u2.re
+                ar1 += t3.re * u3.re + t3.im * u3.im
+                ai1 += t3.re * u3.im - t3.im * u3.re
+                p += Int64(4)
+            var acc = Cplx(Xr.unsafe_load(off + k), Xi.unsafe_load(off + k)) - Cplx(
+                (ar0 + ar1), (ai0 + ai1)
+            )
+            while p < pe:
+                var tv = Cplx(Lxr.unsafe_load(p), Lxi.unsafe_load(p))
                 var idx = off + S_i.unsafe_load(p)
                 var xv = Cplx(Xr.unsafe_load(idx), Xi.unsafe_load(idx))
-                acc = acc - Cplx(t.re * xv.re + t.im * xv.im, t.re * xv.im - t.im * xv.re)
+                acc = acc - Cplx(tv.re * xv.re + tv.im * xv.im, tv.re * xv.im - tv.im * xv.re)
+                p += Int64(1)
             Xr.unsafe_store(off + k, acc.re)
             Xi.unsafe_store(off + k, acc.im)

@@ -8,19 +8,36 @@ import scipy.sparse
 from ._lib import addr, f64, i64, lib
 from ._heat import HeatMethodDistanceSolver
 from ._solver import HalfedgeMesh, IntrinsicGeometry
+from ._tufted import tufted_intrinsic_mesh
 from ._vector_heat import VectorHeatMethodSolver
 from .core import *
 
 
 class MeshHeatMethodDistanceSolver:
+    """`HeatMethodDistanceSolver`, with the robust Laplacian.
+
+    `useRobustLaplacian` runs the mesh through `buildIntrinsicTuftedCover`,
+    `mollifyIntrinsic` and `flipToDelaunay` first (Sharp & Crane, SGP 2020),
+    and every quantity below is then read off the tufted cover instead of the
+    input mesh. The cover is intrinsic data, so it is consumed as an
+    `EdgeLengthGeometry` rather than from positions.
+    """
+
     def __init__(self, V, F, t_coef=1.0, use_robust=True):
         validate_mesh(V, F, force_triangular=True, test_indices=True)
         self.V = f64(V)
         self.F = i64(F)
         self.t_coef = t_coef
         self.use_robust = use_robust
-        self.mesh = HalfedgeMesh(self.F, self.V.shape[0])
-        self.geom = IntrinsicGeometry(self.mesh, self.V)
+        if use_robust:
+            F_tufted, twins, edge_lengths, self.n_flips = tufted_intrinsic_mesh(
+                self.F, self.V, self.V.shape[0]
+            )
+            self.mesh = HalfedgeMesh(F_tufted, self.V.shape[0], twins)
+            self.geom = IntrinsicGeometry.from_edge_lengths(self.mesh, edge_lengths)
+        else:
+            self.mesh = HalfedgeMesh(self.F, self.V.shape[0])
+            self.geom = IntrinsicGeometry(self.mesh, self.V)
         self.solver = HeatMethodDistanceSolver(self.mesh, self.geom, t_coef)
 
     def compute_distance(self, v_ind):

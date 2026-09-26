@@ -4,7 +4,7 @@ Only the operations the heat-method kernels actually use. Kept as plain structs
 so the arithmetic reads like the C++ it is a port of.
 """
 
-from std.math import sqrt, cos, sin, fabs, atan2
+from std.math import sqrt, cos, sin, abs as fabs, atan2
 
 struct Vec2:
     var x: Float64
@@ -129,12 +129,11 @@ struct Vec3:
         var s = sin(theta)
         return self * c + axis.cross(self) * s + axis * (axis.dot(self) * (1.0 - c))
 
-    # Vector3::buildTangentBasis
-    def build_tangent_basis(self) -> Tuple[Vec3, Vec3]:
+    # Vector3::buildTangentBasis, first vector. The second is
+    # `unitDir.cross(basisX).normalize()`.
+    def build_tangent_basis_x(self) -> Vec3:
         var unit_dir = self.normalize()
         var test = Vec3(1.0, 0.0, 0.0)
         if fabs(test.dot(unit_dir)) > 0.9:
             test = Vec3(0.0, 1.0, 0.0)
-        var basis_x = test.cross(unit_dir).normalize()
-        var basis_y = unit_dir.cross(basis_x).normalize()
-        return (basis_x, basis_y)
+        return test.cross(unit_dir).normalize()

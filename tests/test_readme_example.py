@@ -47,6 +47,10 @@ def test_readme_has_a_runnable_usage_block():
         "get_connection_laplacian",
         "transport_tangent_vector",
         "extend_scalar",
+        "PointCloudHeatSolver",
+        "PointCloudLocalTriangulation",
+        "pd = pc.compute_distance",
+        "get_local_triangulation",
     ):
         assert call in src, call
 
@@ -69,3 +73,6 @@ def test_readme_usage_block_runs():
     assert abs(np.linalg.norm(ns["u"], axis=1) - 1.0).max() < 1e-12
     for arr in (ns["bX"], ns["bY"], ns["n"]):
         assert arr.shape == (12, 3)
+    assert ns["pd"].shape == (300,)
+    assert abs(ns["pd"][0]) < 1e-9
+    assert ns["tri"].shape[0] == 300 and ns["tri"].shape[2] == 3

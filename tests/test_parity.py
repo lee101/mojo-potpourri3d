@@ -102,17 +102,15 @@ def test_heat_distance_multisource(closed_mesh):
 
 
 def test_module_level_compute_distance(closed_mesh):
-    """These take no `use_robust` argument, so both sides run the robust path
-    upstream and the non-robust path here; they agree to the intrinsic-Delaunay
-    preprocessing difference, not to roundoff."""
+    """These take no `use_robust` argument, so both sides run the robust path."""
     V, F = closed_mesh
     assert rel_err(
         mpp3d.compute_distance(V, F, 3), pp3d.compute_distance(V, F, 3)
-    ) < 1e-4
+    ) < 1e-12
     assert rel_err(
         mpp3d.compute_distance_multisource(V, F, [3, 9]),
         pp3d.compute_distance_multisource(V, F, [3, 9]),
-    ) < 1e-4
+    ) < 1e-12
 
 
 def test_heat_distance_agrees_with_euclidean_on_a_sphere(closed_mesh):
@@ -128,10 +126,56 @@ def test_heat_distance_agrees_with_euclidean_on_a_sphere(closed_mesh):
     assert np.corrcoef(d, exact)[0, 1] > 0.99
 
 
-def test_robust_laplacian_is_close(closed_mesh):
-    """`use_robust=True` is the upstream default; we take the non-robust path."""
+def test_robust_laplacian_matches(closed_mesh):
+    """`use_robust=True` is the upstream default, and it is the default here."""
     V, F = closed_mesh
-    robust = pp3d.MeshHeatMethodDistanceSolver(V, F).compute_distance(0)
+    ours = mpp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=True).compute_distance(0)
+    theirs = pp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=True).compute_distance(0)
+    assert rel_err(ours, theirs) < 1e-12
+
+
+def test_robust_path_runs_the_delaunay_flips():
+    """A perturbed icosphere is not intrinsically Delaunay, so this exercises
+    `mollifyIntrinsic` -> `buildIntrinsicTuftedCover` -> `flipToDelaunay`."""
+    V, F = icosphere(3)
+    rng = np.random.default_rng(3)
+    V = np.ascontiguousarray(V * (1 + 0.35 * rng.normal(size=V.shape)))
+    ours = mpp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=True)
+    assert ours.n_flips > 100
+    assert rel_err(
+        ours.compute_distance(7),
+        pp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=True).compute_distance(7),
+    ) < 1e-11
+
+
+def test_robust_path_on_a_degenerate_mesh_with_a_boundary():
+    """The most degenerate triangle of a boundary mesh usually touches the
+    boundary, and `mollifyIntrinsic` is the only thing keeping it non-degenerate.
+    A closed mesh never exercises that, because every halfedge has a twin."""
+    V, F = grid_mesh(8)
+    V = np.ascontiguousarray(V)
+    V[0, 2] = 1e-12  # collapse one corner of a boundary triangle
+    ours = mpp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=True).compute_distance(12)
+    assert np.isfinite(ours).all()
+    theirs = pp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=True).compute_distance(12)
+    assert rel_err(ours, theirs) < 1e-8
+
+
+def test_a_non_manifold_edge_is_rejected():
+    """gc stores a non-manifold edge as a sibling cycle, which one twin per
+    halfedge cannot represent; refuse the input instead of reading the odd
+    halfedge out as a boundary edge."""
+    V = np.array([[0.0, 0, 0], [1.0, 0, 0], [0.0, 1, 0], [0.0, 0, 1]], dtype=np.float64)
+    F = np.array([[0, 1, 2], [1, 0, 3], [0, 1, 3]], dtype=np.int64)
+    with pytest.raises(ValueError, match="non-manifold edge"):
+        mpp3d.cotan_laplacian(V, F)
+
+
+def test_robust_and_plain_agree_to_the_mollification_scale(closed_mesh):
+    """The two Laplacian choices differ, but only by the intrinsic-Delaunay
+    preprocessing, which on a well-shaped mesh is a small perturbation."""
+    V, F = closed_mesh
+    robust = mpp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=True).compute_distance(0)
     plain = mpp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=False).compute_distance(0)
     assert rel_err(plain, robust) < 1e-3
 
@@ -160,6 +204,34 @@ def test_tangent_frames_match(closed_mesh):
     for a, b in zip(ours, theirs):
         assert a.shape == b.shape
         assert rel_err(a, b) < 1e-12
+
+
+
+def test_connection_laplacian_matches_on_a_mesh_with_a_boundary(boundary_mesh):
+    """gc scales corner angles by the *vertex's* boundary flag and emits
+    boundary halfedges in the connection Laplacian; a closed-mesh parity test
+    cannot see either."""
+    V, F = boundary_mesh
+    ours = mpp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).get_connection_laplacian()
+    theirs = pp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).get_connection_laplacian()
+    assert rel_err(ours.toarray(), theirs.toarray()) < 1e-11
+
+
+def test_tangent_frames_match_on_a_mesh_with_a_boundary(boundary_mesh):
+    V, F = boundary_mesh
+    ours = mpp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).get_tangent_frames()
+    theirs = pp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).get_tangent_frames()
+    for a, b in zip(ours, theirs):
+        assert rel_err(a, b) < 1e-11
+
+
+def test_transport_tangent_vectors_match_on_a_mesh_with_a_boundary(boundary_mesh):
+    V, F = boundary_mesh
+    inds, vecs = [0, 30], [[1.0, 0.0], [0.0, 1.0]]
+    ours = mpp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).transport_tangent_vectors(inds, vecs)
+    theirs = pp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).transport_tangent_vectors(inds, vecs)
+    assert rel_err(ours, theirs) < 1e-9
+
 
 
 def test_extend_scalar_matches(closed_mesh):
@@ -314,6 +386,45 @@ def test_factorization_row_index_matches_the_column_pattern():
     assert rel_err(fac.solve_vector(b), np.linalg.solve(A, b)) < 1e-9
 
 
+@pytest.mark.parametrize("n", [9, 300, 700])
+def test_duplicate_triplets_are_summed_into_one_entry(n):
+    """The COO assembly orders the whole triplet list by a radix sort.
+
+    Repeated (i, j) pairs have to collapse into one entry, which only happens
+    if equal keys end up adjacent, and the row digits take more than one pass
+    once n passes 256.
+    """
+    from mojo_potpourri3d._solver import Factorization
+
+    rng = np.random.default_rng(11)
+    m = 3 * n
+    r = rng.integers(0, n, m).astype(np.int64)
+    c = rng.integers(0, n, m).astype(np.int64)
+    v = rng.normal(size=m) / np.sqrt(m)
+    # both orientations, as every caller of the factorizer emits
+    rows = np.concatenate([r, c])
+    cols = np.concatenate([c, r])
+    vals = np.concatenate([v, v])
+    idx_ = np.arange(n, dtype=np.int64)
+    S = np.zeros((n, n))
+    np.add.at(S, (rows, cols), vals)
+    diag = np.arange(1.0, n + 1.0)
+    S = S + diag[:, None] * np.eye(n)
+    fac = Factorization(n, np.concatenate([rows, idx_]), np.concatenate([cols, idx_]),
+                        np.concatenate([vals, diag]))
+    A = np.zeros((n, n))
+    for col in range(n):
+        lo, hi = int(fac.Ap[col]), int(fac.Ap[col + 1])
+        A[fac.Ai[lo:hi], col] = fac.Ax[lo:hi]
+        assert np.all(np.diff(fac.Ai[lo:hi]) > 0)  # ascending, no repeats left
+    assert int(fac.Ai.size) == int(np.count_nonzero(S))
+    back = np.zeros((n, n))
+    back[np.ix_(fac.perm, fac.perm)] = A
+    assert np.abs(back - S).max() < 1e-12
+    b = rng.normal(size=n)
+    assert rel_err(fac.solve_vector(b), np.linalg.solve(S, b)) < 1e-8
+
+
 def test_factorization_row_index_on_a_fillless_pattern():
     """A diagonal matrix: no child columns, so the sweep takes the empty path."""
     from mojo_potpourri3d._solver import Factorization
@@ -409,6 +520,17 @@ PUBLIC_API = [
     ("MeshVectorHeatSolver", "transport_tangent_vector"),
     ("MeshVectorHeatSolver", "transport_tangent_vectors"),
     ("MeshVectorHeatSolver", "compute_log_map"),
+    ("PointCloudHeatSolver", None),
+    ("PointCloudLocalTriangulation", None),
+    ("PointCloudHeatSolver", "compute_distance"),
+    ("PointCloudHeatSolver", "compute_distance_multisource"),
+    ("PointCloudHeatSolver", "extend_scalar"),
+    ("PointCloudHeatSolver", "get_tangent_frames"),
+    ("PointCloudHeatSolver", "transport_tangent_vector"),
+    ("PointCloudHeatSolver", "transport_tangent_vectors"),
+    ("PointCloudHeatSolver", "compute_log_map"),
+    ("PointCloudHeatSolver", "compute_signed_distance"),
+    ("PointCloudLocalTriangulation", "get_local_triangulation"),
 ]
 
 
@@ -432,6 +554,7 @@ def test_every_covered_name_exists_upstream():
         "cotan_laplacian", "face_areas", "vertex_areas", "compute_distance",
         "compute_distance_multisource", "validate_mesh", "validate_points",
         "MeshHeatMethodDistanceSolver", "MeshVectorHeatSolver",
+        "PointCloudHeatSolver", "PointCloudLocalTriangulation",
     ]
     for name in covered:
         assert hasattr(pp3d, name), name

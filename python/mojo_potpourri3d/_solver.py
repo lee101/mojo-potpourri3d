@@ -18,7 +18,7 @@ from ._lib import addr, f64, i64, lib
 class HalfedgeMesh:
     """The connectivity arrays `SurfaceMesh` builds from a face list."""
 
-    def __init__(self, F: np.ndarray, n_vertices: int):
+    def __init__(self, F: np.ndarray, n_vertices: int, twins: np.ndarray | None = None):
         F = i64(F).ravel()
         n_faces = F.size // 3
         n_he = 3 * n_faces
@@ -38,17 +38,27 @@ class HalfedgeMesh:
         tmpk = np.zeros(m, dtype=np.int64)
         tmpv = np.zeros(m, dtype=np.int64)
         buckets = np.zeros(256, dtype=np.int64)
-        lib().mpp3d_build_halfedge_mesh(
+        status = lib().mpp3d_build_halfedge_mesh(
             addr(F), n_faces, n_vertices,
             addr(self.he_vertex), addr(self.he_next), addr(self.he_twin),
             addr(self.he_face), addr(self.v_halfedge), addr(self.f_halfedge),
             addr(keys), addr(vals), addr(tmpk), addr(tmpv), addr(buckets),
+            addr(twins) if twins is not None else 0,
         )
+        if status < 0:
+            # gc represents a non-manifold edge as a sibling cycle; one twin
+            # per halfedge cannot, so say so rather than read it as a boundary.
+            raise ValueError("mesh has a non-manifold edge (three or more faces on one edge)")
+
+    @property
+    def is_boundary_halfedge(self) -> np.ndarray:
+        """gc's implicit twin: a boundary halfedge is its own twin."""
+        return self.he_twin == np.arange(self.n_he, dtype=np.int64)
 
     @property
     def n_edges(self) -> int:
         """gc's `mesh.nEdges()`; halfedge storage counts each interior edge twice."""
-        return (self.n_he + int((self.he_twin < 0).sum())) // 2
+        return (self.n_he + int(self.is_boundary_halfedge.sum())) // 2
 
     def args(self) -> list:
         return [
@@ -64,12 +74,31 @@ class IntrinsicGeometry:
     def __init__(self, mesh: HalfedgeMesh, positions: np.ndarray):
         self.mesh = mesh
         self.positions = f64(positions)
+        self.edge_lengths = np.zeros(mesh.n_he, dtype=np.float64)
+        lib().mpp3d_compute_edge_lengths(*mesh.args(), addr(self.positions), addr(self.edge_lengths))
+        self._require_intrinsic()
+        self._require_embedded()
+
+    @classmethod
+    def from_edge_lengths(cls, mesh: HalfedgeMesh, edge_lengths: np.ndarray):
+        """`EdgeLengthGeometry`: an intrinsic mesh given its edge lengths.
+
+        This is what the tufted cover leaves behind -- after the flips the
+        lengths are intrinsic data, not a function of any embedding.
+        """
+        self = cls.__new__(cls)
+        self.mesh = mesh
+        self.positions = f64(np.zeros((mesh.n_vertices, 3)))
+        self.edge_lengths = f64(edge_lengths)
+        self._require_intrinsic()
+        return self
+
+    def _require_intrinsic(self):
+        mesh = self.mesh
         n_he = mesh.n_he
         n_vertices = mesh.n_vertices
         n_faces = mesh.n_faces
-
-        self.edge_lengths = np.zeros(n_he, dtype=np.float64)
-        lib().mpp3d_compute_edge_lengths(*mesh.args(), addr(self.positions), addr(self.edge_lengths))
+        edge_lengths = self.edge_lengths
 
         self.face_areas = np.zeros(n_faces, dtype=np.float64)
         lib().mpp3d_compute_face_areas(*mesh.args(), addr(self.edge_lengths), addr(self.face_areas))
@@ -116,6 +145,13 @@ class IntrinsicGeometry:
         lib().mpp3d_compute_transport_vectors_along_halfedge(
             *mesh.args(), addr(self.halfedge_vectors_in_vertex), addr(self.transport_vectors_along_halfedge)
         )
+
+    def _require_embedded(self):
+        mesh = self.mesh
+        n_he = mesh.n_he
+        n_vertices = mesh.n_vertices
+        n_faces = mesh.n_faces
+        edge_lengths = self.edge_lengths
 
         # Embedded quantities
         self.face_normals = np.zeros(3 * n_faces, dtype=np.float64)
@@ -185,7 +221,6 @@ class Factorization:
         self.ApNew = np.zeros(n + 1, dtype=np.int64)
         self.perm = np.zeros(n, dtype=np.int64)
         self.iperm = np.zeros(n, dtype=np.int64)
-        count = np.zeros(256, dtype=np.int64)
         degree = np.zeros(n, dtype=np.int64)
         visited = np.zeros(n, dtype=np.int64)
         queue = np.zeros(n, dtype=np.int64)
@@ -193,10 +228,13 @@ class Factorization:
         # A separate buffer when there is no imaginary part: permute_upper
         # swaps and sums the two independently.
         imag = self.tim if self.complex else np.zeros(max(nnz_t, 1), dtype=np.float64)
+        sortbuf = np.zeros((4, max(nnz_t, 1)), dtype=np.int64)
         nnzA = lib().mpp3d_permute_upper(
             n, addr(self.ti), addr(self.tj), addr(self.tr), addr(imag), nnz_t,
             addr(degree), addr(visited), addr(queue), addr(self.perm), addr(self.iperm),
-            addr(count), addr(self.Ap), addr(self.Ai), addr(self.Ax), addr(self.Axi), addr(self.ApNew),
+            addr(self.Ap), addr(self.Ai), addr(self.Ax), addr(self.Axi),
+            addr(self.ApNew), addr(sortbuf[0]), addr(sortbuf[1]), addr(sortbuf[2]),
+            addr(sortbuf[3]),
         )
         self.Ap = self.ApNew
         self.Ai = np.ascontiguousarray(self.Ai[:nnzA])
