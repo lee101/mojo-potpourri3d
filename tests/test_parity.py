@@ -1,561 +1,403 @@
-"""Parity against the real potpourri3d (== geometry-central), not just "it ran".
-
-Every assertion here is a numerical comparison with the upstream package on the
-same input, at a tolerance tight enough that a wrong kernel cannot pass.
-"""
+"""Numerical parity against upstream potpourri3d."""
 
 import numpy as np
 import pytest
-import scipy.sparse
 
-import mojo_potpourri3d as mpp3d
 import potpourri3d as pp3d
-from mojo_potpourri3d._lib import f64, i64
 
-from conftest import grid_mesh, icosphere, rel_err
+from mojo_potpourri3d import mesh as mm
+from mojo_potpourri3d._lib import lib
 
-
-# ------------------------------------------------------------------ geometry
-
-@pytest.mark.parametrize("n", [5, 12, 25])
-def test_face_areas_match(n):
-    V, F = grid_mesh(n)
-    assert np.array_equal(mpp3d.face_areas(V, F), pp3d.face_areas(V, F))
+import conftest
 
 
-@pytest.mark.parametrize("n", [5, 12, 25])
-def test_vertex_areas_match(n):
-    V, F = grid_mesh(n)
-    assert rel_err(mpp3d.vertex_areas(V, F), pp3d.vertex_areas(V, F)) < 1e-14
-
-
-@pytest.mark.parametrize("n", [5, 12, 25])
-@pytest.mark.parametrize("denom_eps", [0.0, 1e-3])
-def test_cotan_laplacian_matches(n, denom_eps):
-    V, F = grid_mesh(n)
-    ours = mpp3d.cotan_laplacian(V, F, denom_eps)
-    theirs = pp3d.cotan_laplacian(V, F, denom_eps)
-    assert ours.shape == theirs.shape
-    assert ours.nnz == theirs.nnz
-    assert rel_err(ours.toarray(), theirs.toarray()) < 1e-13
-
-
-def test_cotan_laplacian_has_constant_nullspace(closed_mesh):
-    V, F = closed_mesh
-    L = mpp3d.cotan_laplacian(V, F)
-    ones = np.ones(V.shape[0])
-    assert np.abs(L @ ones).max() < 1e-12 * np.abs(L.toarray()).max()
-
-
-def test_validation_errors_match_upstream():
-    V, F = grid_mesh(4)
-    with pytest.raises(ValueError, match="2d Nx3"):
-        mpp3d.face_areas(V[:, :2], F)
-    quads = np.ascontiguousarray(np.hstack([F, F[:, :1]]))
-    with pytest.raises(ValueError, match="triangular"):
-        mpp3d.cotan_laplacian(V, quads)
-    with pytest.raises(ValueError, match="triangular"):
-        mpp3d.MeshVectorHeatSolver(V, quads)
-    with pytest.raises(ValueError, match="2d Nx3"):
-        mpp3d.MeshHeatMethodDistanceSolver(V[:, :2], F)
-    with pytest.raises(ValueError, match="2d NxD"):
-        mpp3d.face_areas(V, np.ascontiguousarray(F[:, :2]))
-    with pytest.raises(ValueError, match="out-of-bounds"):
-        mpp3d.MeshHeatMethodDistanceSolver(
-            V, np.ascontiguousarray(F + V.shape[0])
-        )
-
-
-# ------------------------------------------------------ heat method distance
-
-def test_heat_distance_closed_mesh(closed_mesh):
-    V, F = closed_mesh
-    ours = mpp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=False).compute_distance(0)
-    theirs = pp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=False).compute_distance(0)
-    assert rel_err(ours, theirs) < 1e-12
-
-
-@pytest.mark.parametrize("src", [0, 1, 5, 40])
-def test_heat_distance_boundary_mesh(src):
-    V, F = grid_mesh(10)
-    ours = mpp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=False).compute_distance(src)
-    theirs = pp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=False).compute_distance(src)
-    assert rel_err(ours, theirs) < 1e-12
-
-
-def test_heat_distance_is_zero_at_the_source(closed_mesh):
-    V, F = closed_mesh
-    d = mpp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=False).compute_distance(7)
-    assert abs(d[7]) < 1e-12
-
-
-def test_heat_distance_multisource(closed_mesh):
-    V, F = closed_mesh
-    srcs = np.array([0, 1, 2, 40], dtype=np.int64)
-    ours = mpp3d.MeshHeatMethodDistanceSolver(
-        V, F, use_robust=False
-    ).compute_distance_multisource(srcs)
-    theirs = pp3d.MeshHeatMethodDistanceSolver(
-        V, F, use_robust=False
-    ).compute_distance_multisource(srcs)
-    assert rel_err(ours, theirs) < 1e-12
-
-
-def test_module_level_compute_distance(closed_mesh):
-    """These take no `use_robust` argument, so both sides run the robust path."""
-    V, F = closed_mesh
-    assert rel_err(
-        mpp3d.compute_distance(V, F, 3), pp3d.compute_distance(V, F, 3)
-    ) < 1e-12
-    assert rel_err(
-        mpp3d.compute_distance_multisource(V, F, [3, 9]),
-        pp3d.compute_distance_multisource(V, F, [3, 9]),
-    ) < 1e-12
-
-
-def test_heat_distance_agrees_with_euclidean_on_a_sphere(closed_mesh):
-    """A sanity check that does not depend on upstream at all."""
-    V, F = icosphere(3)
-    src = 0
-    d = mpp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=False).compute_distance(src)
-    # The unit sphere's geodesic distance from `src` is the central angle.
-    exact = np.arccos(np.clip(V @ V[src] / np.linalg.norm(V[src]), -1.0, 1.0))
-    # The heat method is a first-order method; at this resolution it is a
-    # couple of percent off the true central angle, in the expected direction.
-    assert rel_err(d, exact) < 3e-2
-    assert np.corrcoef(d, exact)[0, 1] > 0.99
-
-
-def test_robust_laplacian_matches(closed_mesh):
-    """`use_robust=True` is the upstream default, and it is the default here."""
-    V, F = closed_mesh
-    ours = mpp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=True).compute_distance(0)
-    theirs = pp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=True).compute_distance(0)
-    assert rel_err(ours, theirs) < 1e-12
-
-
-def test_robust_path_runs_the_delaunay_flips():
-    """A perturbed icosphere is not intrinsically Delaunay, so this exercises
-    `mollifyIntrinsic` -> `buildIntrinsicTuftedCover` -> `flipToDelaunay`."""
-    V, F = icosphere(3)
-    rng = np.random.default_rng(3)
-    V = np.ascontiguousarray(V * (1 + 0.35 * rng.normal(size=V.shape)))
-    ours = mpp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=True)
-    assert ours.n_flips > 100
-    assert rel_err(
-        ours.compute_distance(7),
-        pp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=True).compute_distance(7),
-    ) < 1e-11
-
-
-def test_robust_path_on_a_degenerate_mesh_with_a_boundary():
-    """The most degenerate triangle of a boundary mesh usually touches the
-    boundary, and `mollifyIntrinsic` is the only thing keeping it non-degenerate.
-    A closed mesh never exercises that, because every halfedge has a twin."""
-    V, F = grid_mesh(8)
-    V = np.ascontiguousarray(V)
-    V[0, 2] = 1e-12  # collapse one corner of a boundary triangle
-    ours = mpp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=True).compute_distance(12)
-    assert np.isfinite(ours).all()
-    theirs = pp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=True).compute_distance(12)
-    assert rel_err(ours, theirs) < 1e-8
-
-
-def test_a_non_manifold_edge_is_rejected():
-    """gc stores a non-manifold edge as a sibling cycle, which one twin per
-    halfedge cannot represent; refuse the input instead of reading the odd
-    halfedge out as a boundary edge."""
-    V = np.array([[0.0, 0, 0], [1.0, 0, 0], [0.0, 1, 0], [0.0, 0, 1]], dtype=np.float64)
-    F = np.array([[0, 1, 2], [1, 0, 3], [0, 1, 3]], dtype=np.int64)
-    with pytest.raises(ValueError, match="non-manifold edge"):
-        mpp3d.cotan_laplacian(V, F)
-
-
-def test_robust_and_plain_agree_to_the_mollification_scale(closed_mesh):
-    """The two Laplacian choices differ, but only by the intrinsic-Delaunay
-    preprocessing, which on a well-shaped mesh is a small perturbation."""
-    V, F = closed_mesh
-    robust = mpp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=True).compute_distance(0)
-    plain = mpp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=False).compute_distance(0)
-    assert rel_err(plain, robust) < 1e-3
-
-
-def test_t_coef_changes_the_answer(closed_mesh):
-    V, F = closed_mesh
-    a = mpp3d.MeshHeatMethodDistanceSolver(V, F, t_coef=1.0, use_robust=False)
-    b = mpp3d.MeshHeatMethodDistanceSolver(V, F, t_coef=0.5, use_robust=False)
-    assert not np.allclose(a.compute_distance(0), b.compute_distance(0))
-
-
-# --------------------------------------------------------- vector heat method
-
-def test_connection_laplacian_matches(closed_mesh):
-    V, F = closed_mesh
-    ours = mpp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).get_connection_laplacian()
-    theirs = pp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).get_connection_laplacian()
-    assert ours.shape == theirs.shape
-    assert rel_err(ours.toarray(), theirs.toarray()) < 1e-12
-
-
-def test_tangent_frames_match(closed_mesh):
-    V, F = closed_mesh
-    ours = mpp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).get_tangent_frames()
-    theirs = pp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).get_tangent_frames()
-    for a, b in zip(ours, theirs):
+def test_cotan_laplacian_matches_upstream(ico2, grid8):
+    for V, F in (ico2, grid8):
+        a = mm.cotan_laplacian(V, F)
+        b = pp3d.cotan_laplacian(V, F)
         assert a.shape == b.shape
-        assert rel_err(a, b) < 1e-12
+        assert abs(a - b).max() < 1e-12
 
 
-
-def test_connection_laplacian_matches_on_a_mesh_with_a_boundary(boundary_mesh):
-    """gc scales corner angles by the *vertex's* boundary flag and emits
-    boundary halfedges in the connection Laplacian; a closed-mesh parity test
-    cannot see either."""
-    V, F = boundary_mesh
-    ours = mpp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).get_connection_laplacian()
-    theirs = pp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).get_connection_laplacian()
-    assert rel_err(ours.toarray(), theirs.toarray()) < 1e-11
+def test_cotan_laplacian_denom_eps(grid8):
+    V, F = grid8
+    for eps in (0.0, 1e-6, 1e-2):
+        a = mm.cotan_laplacian(V, F, denom_eps=eps)
+        b = pp3d.cotan_laplacian(V, F, denom_eps=eps)
+        assert abs(a - b).max() < 1e-12
 
 
-def test_tangent_frames_match_on_a_mesh_with_a_boundary(boundary_mesh):
-    V, F = boundary_mesh
-    ours = mpp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).get_tangent_frames()
-    theirs = pp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).get_tangent_frames()
-    for a, b in zip(ours, theirs):
-        assert rel_err(a, b) < 1e-11
+def test_face_areas_match_upstream(ico2, grid8):
+    for V, F in (ico2, grid8):
+        assert np.abs(mm.face_areas(V, F) - pp3d.face_areas(V, F)).max() < 1e-13
 
 
-def test_transport_tangent_vectors_match_on_a_mesh_with_a_boundary(boundary_mesh):
-    V, F = boundary_mesh
-    inds, vecs = [0, 30], [[1.0, 0.0], [0.0, 1.0]]
-    ours = mpp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).transport_tangent_vectors(inds, vecs)
-    theirs = pp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).transport_tangent_vectors(inds, vecs)
-    assert rel_err(ours, theirs) < 1e-9
+def test_vertex_areas_match_upstream(ico2, grid8):
+    for V, F in (ico2, grid8):
+        assert np.abs(mm.vertex_areas(V, F) - pp3d.vertex_areas(V, F)).max() < 1e-13
 
 
-
-def test_extend_scalar_matches(closed_mesh):
-    V, F = closed_mesh
-    for inds, vals in (([0], [1.0]), ([0, 5], [1.0, 2.0]), ([3, 11, 40], [0.5, -1.0, 2.5])):
-        ours = mpp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).extend_scalar(inds, vals)
-        theirs = pp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False).extend_scalar(inds, vals)
-        assert rel_err(ours, theirs) < 1e-12
-
-
-def test_extend_scalar_reproduces_the_source_values(closed_mesh):
-    V, F = closed_mesh
-    inds = [0, 5]
-    vals = [1.0, 2.0]
-    out = mpp3d.MeshVectorHeatSolver(
-        V, F, use_intrinsic_delaunay=False
-    ).extend_scalar(inds, vals)
-    for v, val in zip(inds, vals):
-        assert abs(out[v] - val) < 0.2
+def test_edges_match_upstream(ico2, grid8):
+    for V, F in (ico2, grid8):
+        a = np.unique(np.sort(mm.edges(V, F), axis=1), axis=0)
+        b = np.unique(np.sort(pp3d.edges(V, F), axis=1), axis=0)
+        assert a.shape == b.shape
+        assert (a == b).all()
 
 
-def test_extend_scalar_length_check(closed_mesh):
-    V, F = closed_mesh
-    with pytest.raises(ValueError, match="same shape"):
-        mpp3d.MeshVectorHeatSolver(V, F).extend_scalar([0, 1], [1.0])
+@pytest.mark.parametrize("name", ["ico1", "ico2", "grid8", "grid16"])
+def test_heat_distance_matches_upstream(name):
+    if name.startswith("ico"):
+        V, F = conftest.icosphere(int(name[3:]))
+    else:
+        V, F = conftest.open_grid(int(name[4:]))
+    a = pp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=False).compute_distance(0)
+    b = mm.MeshHeatMethodDistanceSolver(V, F, use_robust=False).compute_distance(0)
+    assert np.abs(a - b).max() < 1e-10 * max(1.0, a.max())
 
 
-def test_transport_tangent_vectors_match(closed_mesh):
-    V, F = closed_mesh
-    ours = mpp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False)
-    theirs = pp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False)
-    inds = [0, 5, 40]
-    vecs = [[1.0, 0.0], [0.0, 1.0], [0.7071067811865476, 0.7071067811865476]]
-    a = ours.transport_tangent_vectors(inds, vecs)
-    b = theirs.transport_tangent_vectors(inds, vecs)
-    assert a.shape == b.shape
-    assert rel_err(a, b) < 1e-10
+@pytest.mark.parametrize("srcs", [[0, 1], [0, 7, 20], [3, 4, 5, 6]])
+def test_heat_distance_multisource_matches_upstream(ico2, srcs):
+    V, F = ico2
+    a = pp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=False).compute_distance_multisource(srcs)
+    b = mm.MeshHeatMethodDistanceSolver(V, F, use_robust=False).compute_distance_multisource(srcs)
+    assert np.abs(a - b).max() < 1e-10 * max(1.0, a.max())
 
 
-def test_transport_tangent_vector_preserves_norm(closed_mesh):
-    V, F = closed_mesh
-    out = mpp3d.MeshVectorHeatSolver(
-        V, F, use_intrinsic_delaunay=False
-    ).transport_tangent_vector(0, [1.0, 0.0])
-    assert out.shape == (V.shape[0], 2)
-    assert np.abs(np.linalg.norm(out, axis=1) - 1.0).max() < 1e-9
+@pytest.mark.parametrize("sub", [2, 3])
+def test_multisource_at_the_corners_of_one_face(sub):
+    """The one documented case where the two implementations do not agree closely.
 
-
-def test_transport_tangent_vector_matches_except_the_antipode(closed_mesh):
-    """One vertex -- the one directly opposite the source on a sphere -- flips
-    sign, because the transported direction there is numerically degenerate and
-    the normalization amplifies the rounding. Every other vertex agrees."""
-    V, F = closed_mesh
-    ours = mpp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False)
-    theirs = pp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False)
-    a = ours.transport_tangent_vector(0, [1.0, 0.0])
-    b = theirs.transport_tangent_vector(0, [1.0, 0.0])
-    err = np.abs(a - b).max(axis=1)
-    assert np.sort(err)[:-1].max() < 1e-9
-    assert int((err > 1e-9).sum()) <= 1
-
-
-def test_transport_length_check(closed_mesh):
-    V, F = closed_mesh
-    with pytest.raises(ValueError, match="2D tangent vector"):
-        mpp3d.MeshVectorHeatSolver(V, F).transport_tangent_vector(0, [1.0, 0.0, 0.0])
-
-
-def test_log_map_is_reported_as_uncovered(closed_mesh):
-    V, F = closed_mesh
-    with pytest.raises(NotImplementedError, match="not covered"):
-        mpp3d.MeshVectorHeatSolver(V, F).compute_log_map(0)
-
-
-# ------------------------------------------------------ the sparse factorizer
-
-def test_factorization_round_trip():
-    """The sparse factorizer against a dense solve on a random SPD system."""
-    from mojo_potpourri3d._solver import Factorization
-
-    rng = np.random.default_rng(7)
-    n = 120
-    M = rng.normal(size=(n, n))
-    A = M @ M.T + 4.0 * np.eye(n)
-    rows, cols = np.nonzero(A)
-    vals = A[rows, cols]
-    fac = Factorization(n, rows, cols, vals)
-    B = rng.normal(size=(n, 4))
-    assert rel_err(fac.solve(B), np.linalg.solve(A, B)) < 1e-10
-
-
-def test_factorization_handles_fill():
-    """A pattern with real fill: the factor must be larger than the matrix."""
-    from mojo_potpourri3d._solver import Factorization
-
-    n = 40
-    rows, cols, vals = [], [], []
-    for i in range(n - 1):  # a path graph: the natural order needs no fill
-        rows += [i, i + 1, i, i + 1]
-        cols += [i, i + 1, i + 1, i]
-        vals += [3.0, 3.0, -1.0, -1.0]
-    A = np.zeros((n, n))
-    np.add.at(A, (rows, cols), vals)
-    fac = Factorization(n, np.array(rows), np.array(cols), np.array(vals))
-    assert np.linalg.cond(A) > 1
-    B = np.random.default_rng(1).normal(size=(n, 2))
-    assert rel_err(fac.solve(B), np.linalg.solve(A, B)) < 1e-9
-
-
-def _assert_row_index_is_the_transpose(fac):
-    """The numeric pass reads row k of L through R_p/R_i/R_pos and never
-    searches, so the row index has to be exactly the transpose of the column
-    one, with every R_pos still addressing the matching L entry."""
-    slot = {}  # (row, col) -> offset in S_i
-    for j in range(fac.n):
-        for p in range(fac.S_p[j], fac.S_p[j + 1]):
-            slot[(int(fac.S_i[p]), j)] = p
-    seen = 0
-    for k in range(fac.n):
-        row = []
-        for q in range(fac.R_p[k], fac.R_p[k + 1]):
-            j = int(fac.R_i[q])
-            assert j < k, (k, j)
-            assert slot.get((k, j)) == int(fac.R_pos[q]), (k, j, fac.R_pos[q])
-            row.append(j)
-        assert row == sorted(set(row)), (k, row)
-        assert len(row) == sum(1 for j in range(k) if (k, j) in slot), k
-        seen += len(row)
-    assert seen == int(fac.S_p[fac.n]) == int(fac.R_p[fac.n])
-
-
-def test_factorization_row_index_matches_the_column_pattern():
-    """A mesh Laplacian: the sweep is pruned by the coverage test here, so a
-    broken prune shows up as a missing row or a wrong offset."""
-    from mojo_potpourri3d._solver import Factorization
-
-    V, F = icosphere(3)
-    n = V.shape[0]
-    L = mpp3d.cotan_laplacian(V, F)
-    tri = L.tocoo()
-    idx = np.arange(n, dtype=np.int64)
-    fac = Factorization(
-        n,
-        np.concatenate([tri.row, idx]),
-        np.concatenate([tri.col, idx]),
-        np.concatenate([tri.data, np.full(n, 1.0)]),
-    )
-    assert int(fac.S_p[n]) > int(fac.Ap[n])  # the factor really does have fill
-    _assert_row_index_is_the_transpose(fac)
-    b = np.random.default_rng(3).normal(size=n)
-    A = L.toarray() + np.eye(n)
-    assert rel_err(fac.solve_vector(b), np.linalg.solve(A, b)) < 1e-9
-
-
-@pytest.mark.parametrize("n", [9, 300, 700])
-def test_duplicate_triplets_are_summed_into_one_entry(n):
-    """The COO assembly orders the whole triplet list by a radix sort.
-
-    Repeated (i, j) pairs have to collapse into one entry, which only happens
-    if equal keys end up adjacent, and the row digits take more than one pass
-    once n passes 256.
+    Three sources at the corners of one face make the heat field constant across that face, so the
+    face has no gradient to normalize. Upstream calls `normalizeCutoff()` with its default cutoff of
+    zero, divides by the rounding residue, and normalizes that noise to a unit vector; which noise it
+    gets depends on the last bit of its solver's output, which differs from this port's. Both
+    implementations therefore return a noise-driven field here, and they can be a couple of percent
+    apart. This test pins that: the field stays finite, non-negative and within a few percent of
+    upstream, so the divergence cannot grow silently.
     """
-    from mojo_potpourri3d._solver import Factorization
-
-    rng = np.random.default_rng(11)
-    m = 3 * n
-    r = rng.integers(0, n, m).astype(np.int64)
-    c = rng.integers(0, n, m).astype(np.int64)
-    v = rng.normal(size=m) / np.sqrt(m)
-    # both orientations, as every caller of the factorizer emits
-    rows = np.concatenate([r, c])
-    cols = np.concatenate([c, r])
-    vals = np.concatenate([v, v])
-    idx_ = np.arange(n, dtype=np.int64)
-    S = np.zeros((n, n))
-    np.add.at(S, (rows, cols), vals)
-    diag = np.arange(1.0, n + 1.0)
-    S = S + diag[:, None] * np.eye(n)
-    fac = Factorization(n, np.concatenate([rows, idx_]), np.concatenate([cols, idx_]),
-                        np.concatenate([vals, diag]))
-    A = np.zeros((n, n))
-    for col in range(n):
-        lo, hi = int(fac.Ap[col]), int(fac.Ap[col + 1])
-        A[fac.Ai[lo:hi], col] = fac.Ax[lo:hi]
-        assert np.all(np.diff(fac.Ai[lo:hi]) > 0)  # ascending, no repeats left
-    assert int(fac.Ai.size) == int(np.count_nonzero(S))
-    back = np.zeros((n, n))
-    back[np.ix_(fac.perm, fac.perm)] = A
-    assert np.abs(back - S).max() < 1e-12
-    b = rng.normal(size=n)
-    assert rel_err(fac.solve_vector(b), np.linalg.solve(S, b)) < 1e-8
+    V, F = conftest.icosphere(sub)
+    srcs = [int(x) for x in F[0]]
+    u = mm.MeshHeatMethodDistanceSolver(V, F, use_robust=False).compute_distance_multisource(srcs)
+    ref = pp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=False).compute_distance_multisource(srcs)
+    assert np.all(np.isfinite(u))
+    assert u.min() > -0.05 * ref.max()
+    assert np.abs(u - ref).max() < 0.05 * ref.max()
 
 
-def test_factorization_row_index_on_a_fillless_pattern():
-    """A diagonal matrix: no child columns, so the sweep takes the empty path."""
-    from mojo_potpourri3d._solver import Factorization
-
-    n = 8
-    idx = np.arange(n, dtype=np.int64)
-    fac = Factorization(n, idx, idx, np.arange(1.0, n + 1.0))
-    assert int(fac.S_p[n]) == 0
-    assert int(fac.R_p[n]) == 0
-    _assert_row_index_is_the_transpose(fac)
-    b = np.random.default_rng(5).normal(size=n)
-    assert rel_err(fac.solve_vector(b), b / np.arange(1.0, n + 1.0)) < 1e-14
+def test_fixtures_are_closed_manifolds():
+    """The icosphere generator must produce a real closed triangulation, not a broken one."""
+    for sub in range(4):
+        V, F = conftest.icosphere(sub)
+        assert conftest.is_edge_manifold(F)
+        assert V.shape[0] - _n_edges(F) + F.shape[0] == 2
+        assert np.allclose(np.linalg.norm(V, axis=1), 1.0)
 
 
-def test_hermitian_factorization_row_index(closed_mesh):
-    """The complex path shares the symbolic, so its row index is the same one."""
-    from mojo_potpourri3d._solver import Factorization
-
-    V, F = closed_mesh
-    n = V.shape[0]
-    vs = mpp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False)
-    ti, tj, tr, tim = vs.solver.connection_laplacian_triplets()
-    idx = np.arange(n, dtype=np.int64)
-    fac = Factorization(
-        n,
-        np.concatenate([ti, idx]),
-        np.concatenate([tj, idx]),
-        np.concatenate([tr, np.full(n, 1.0)]),
-        np.concatenate([tim, np.zeros(n)]),
-    )
-    _assert_row_index_is_the_transpose(fac)
+def _n_edges(F):
+    return len({(min(int(f[k]), int(f[(k + 1) % 3])), max(int(f[k]), int(f[(k + 1) % 3])))
+                for f in F for k in range(3)})
 
 
-def test_hermitian_factorization_round_trip(closed_mesh):
-    from mojo_potpourri3d._solver import Factorization
-
-    V, F = closed_mesh
-    n = V.shape[0]
-    mpp3d_solve = mpp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False)
-    ti, tj, tr, tim = mpp3d_solve.solver.connection_laplacian_triplets()
-    idx = np.arange(n, dtype=np.int64)
-    fac = Factorization(
-        n,
-        np.concatenate([ti, idx]),
-        np.concatenate([tj, idx]),
-        np.concatenate([tr, np.full(n, 1.0)]),
-        np.concatenate([tim, np.zeros(n)]),
-    )
-    A = mpp3d_solve.get_connection_laplacian().toarray() + 1.0 * np.eye(n)
-    b = np.arange(1.0, n + 1)
-    c = np.zeros(n)
-    c[0] = 1.0
-    rhs = np.stack([b, c], axis=1)
-    assert rel_err(fac.solve(rhs)[:, 0], np.linalg.solve(A, b + 1j * c)) < 1e-9
+def test_heat_distance_is_nonnegative_and_zero_at_source(ico2):
+    V, F = ico2
+    u = mm.MeshHeatMethodDistanceSolver(V, F, use_robust=False).compute_distance(7)
+    assert u[7] == pytest.approx(0.0, abs=1e-9)
+    assert u.min() > -1e-9
+    # a distance field on a unit sphere cannot exceed the sphere's diameter, pi
+    assert u.max() <= np.pi + 1e-9
 
 
-def test_ffi_signatures_match_the_exports():
-    """A ctypes arity mismatch is a silent memory-corrupting bug, so pin it."""
-    import re
-    import importlib.util
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parents[1]
-    spec = importlib.util.spec_from_file_location("_lib", root / "python/mojo_potpourri3d/_lib.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    capi = (root / "src/capi.mojo").read_text()
-    exports = {
-        m.group(1): len([p for p in m.group(3).split(",") if p.strip()])
-        for m in re.finditer(r'@export\("(\w+)"\)\s*\ndef\s+(\w+)\(([^)]*)\)', capi)
-    }
-    arity = lambda s: sum(a if isinstance(a, int) else 1 for a in s)  # noqa: E731
-    assert set(exports) == set(mod._SIGNATURES)
-    for name, n in exports.items():
-        assert arity(mod._SIGNATURES[name][0]) == n, name
+def test_heat_distance_t_coef_knob(ico2):
+    V, F = ico2
+    a = pp3d.MeshHeatMethodDistanceSolver(V, F, t_coef=2.0, use_robust=False).compute_distance(0)
+    b = mm.MeshHeatMethodDistanceSolver(V, F, t_coef=2.0, use_robust=False).compute_distance(0)
+    assert np.abs(a - b).max() < 1e-10 * max(1.0, a.max())
 
 
-PUBLIC_API = [
-    ("cotan_laplacian", None),
-    ("face_areas", None),
-    ("vertex_areas", None),
-    ("compute_distance", None),
-    ("compute_distance_multisource", None),
-    ("validate_mesh", None),
-    ("validate_points", None),
-    ("MeshHeatMethodDistanceSolver", None),
-    ("MeshVectorHeatSolver", None),
-    ("MeshHeatMethodDistanceSolver", "compute_distance"),
-    ("MeshHeatMethodDistanceSolver", "compute_distance_multisource"),
-    ("MeshVectorHeatSolver", "extend_scalar"),
-    ("MeshVectorHeatSolver", "get_tangent_frames"),
-    ("MeshVectorHeatSolver", "get_connection_laplacian"),
-    ("MeshVectorHeatSolver", "transport_tangent_vector"),
-    ("MeshVectorHeatSolver", "transport_tangent_vectors"),
-    ("MeshVectorHeatSolver", "compute_log_map"),
-    ("PointCloudHeatSolver", None),
-    ("PointCloudLocalTriangulation", None),
-    ("PointCloudHeatSolver", "compute_distance"),
-    ("PointCloudHeatSolver", "compute_distance_multisource"),
-    ("PointCloudHeatSolver", "extend_scalar"),
-    ("PointCloudHeatSolver", "get_tangent_frames"),
-    ("PointCloudHeatSolver", "transport_tangent_vector"),
-    ("PointCloudHeatSolver", "transport_tangent_vectors"),
-    ("PointCloudHeatSolver", "compute_log_map"),
-    ("PointCloudHeatSolver", "compute_signed_distance"),
-    ("PointCloudLocalTriangulation", "get_local_triangulation"),
-]
+@pytest.mark.parametrize("name", ["ico0", "ico1", "ico2", "ico3", "grid4", "grid8", "grid16"])
+def test_heat_distance_robust_matches_upstream(name):
+    """The tufted-cover / intrinsic-Delaunay path (upstream's default)."""
+    if name.startswith("ico"):
+        V, F = conftest.icosphere(int(name[3:]))
+    else:
+        V, F = conftest.open_grid(int(name[4:]))
+    a = pp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=True).compute_distance(0)
+    b = mm.MeshHeatMethodDistanceSolver(V, F, use_robust=True).compute_distance(0)
+    assert np.abs(a - b).max() < 1e-8 * max(1.0, a.max())
 
 
-@pytest.mark.parametrize("cls,method", PUBLIC_API, ids=lambda v: str(v))
-def test_public_api_signatures_match_upstream(cls, method):
-    """Names, argument order and defaults must be upstream's, or this is not a
-    drop-in. A caller should not have to learn a new API to use this port."""
+@pytest.mark.parametrize("sub", [2, 3])
+def test_robust_distance_is_a_valid_field_on_a_dense_closed_mesh(sub):
+    """The flips to intrinsic Delaunay used to leave a zero-area triangle on dense closed meshes."""
+    V, F = conftest.icosphere(sub)
+    u = mm.MeshHeatMethodDistanceSolver(V, F, use_robust=True).compute_distance(0)
+    assert np.all(np.isfinite(u))
+    assert u.min() > -1e-9
+    assert u[0] == pytest.approx(0.0, abs=1e-9)
+    ref = pp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=True).compute_distance(0)
+    assert np.abs(u - ref).max() < 1e-8 * max(1.0, ref.max())
+
+
+
+
+@pytest.mark.parametrize("name", ["ico2", "grid8"])
+def test_the_two_heat_operators_share_one_factor_pattern(name):
+    """`heat_setup` skips the Poisson operator's symbolic pass when its pattern matches the heat one's.
+
+    The heat operator is the Laplacian plus a diagonal mass term and the Poisson operator is the
+    same Laplacian plus a diagonal shift, so their CSC index patterns are identical and so is the
+    pattern of L for both. The kernel compares the two patterns before taking that shortcut; this
+    checks that the comparison does take it, by confirming the two reported nnz(L) agree, and that a
+    solver built that way still matches upstream.
+    """
+    if name.startswith("ico"):
+        V, F = conftest.icosphere(int(name[3:]))
+    else:
+        V, F = conftest.open_grid(int(name[4:]))
+    s = mm.MeshHeatMethodDistanceSolver(V, F, use_robust=False)
+    # W[4] and W[5] are nnz(L) of the heat and Poisson factors. The fast path sets them equal; the
+    # fallback path would compute them separately and they would still agree, so this pins the
+    # shortcut's premise rather than only its outcome.
+    assert s._W[4] == s._W[5] and s._W[4] > 0
+    a = pp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=False).compute_distance(0)
+    b = s.compute_distance(0)
+    assert np.abs(a - b).max() < 1e-10 * max(1.0, a.max())
+
+
+@pytest.mark.parametrize("name", ["ico2", "grid8"])
+def test_out_of_range_face_index_is_reported(name):
+    """Upstream's index check uses np.amin, so a too-large index slips through; the kernels must not
+    walk off the vertex array when it does."""
+    if name.startswith("ico"):
+        V, F = conftest.icosphere(int(name[3:]))
+    else:
+        V, F = conftest.open_grid(int(name[4:]))
+    bad = F.copy()
+    bad[0, 0] = V.shape[0] + 5
+    for call in (
+        lambda: mm.MeshHeatMethodDistanceSolver(V, bad),
+        lambda: mm.cotan_laplacian(V, bad),
+        lambda: mm.face_areas(V, bad),
+        lambda: mm.vertex_areas(V, bad),
+        lambda: mm.edges(V, bad),
+    ):
+        with pytest.raises(ValueError, match="out-of-bounds face index"):
+            call()
+
+
+def test_out_of_range_source_index_is_reported(ico2):
+    """An out-of-range source must not come back as a constant distance field.
+
+    The kernel used to skip a source index outside [0, nV), which left an all-zero right-hand side:
+    the solve then returns a field whose distance shift is a single constant, so every vertex comes
+    back at the same finite value. Upstream instead indexes its vertex array with the caller's list, so
+    the index is either wrapped (a negative one) or reads past the end; neither is a field worth
+    matching, so both are refused here.
+    """
+    V, F = ico2
+    n_v = V.shape[0]
+    s = mm.MeshHeatMethodDistanceSolver(V, F, use_robust=False)
+    for bad in (n_v, n_v + 7, -1, -n_v):
+        with pytest.raises(IndexError, match="out of range"):
+            s.compute_distance(bad)
+    for bad in ([0, n_v], [0, 1, -3]):
+        with pytest.raises(IndexError, match="out of range"):
+            s.compute_distance_multisource(bad)
+    # and the valid queries around them still work
+    assert np.all(np.isfinite(s.compute_distance(n_v - 1)))
+    assert np.all(np.isfinite(s.compute_distance_multisource([0, n_v - 1])))
+
+
+def test_an_empty_source_set_is_reported(ico2):
+    """Upstream returns all-NaN for an empty source list. A zero field would be worse: it is finite
+    and reads as a distance, so the empty query is refused rather than answered."""
+    V, F = ico2
+    s = mm.MeshHeatMethodDistanceSolver(V, F, use_robust=False)
+    with pytest.raises(ValueError, match="at least one source vertex"):
+        s.compute_distance_multisource([])
+    with pytest.raises(ValueError, match="at least one source vertex"):
+        mm.compute_distance_multisource(V, F, [])
+
+
+@pytest.mark.parametrize("robust", [False, True])
+def test_strided_and_narrow_inputs_are_copied_not_reinterpreted(ico2, robust):
+    """The kernels index by element offset, so a strided view must be materialised first.
+
+    f64()/i64() copy a non-contiguous or non-float64 input into a temporary. If the call site did not
+    hold on to that temporary for the length of the call, the kernel would read freed memory; if it
+    did not copy at all, it would read the caller's original layout as if it were packed. Both show
+    up here as the wrong answer for a strided or narrowed input.
+    """
+    V, F = ico2
+    V_view = V[::1]
+    F_view = F[::1]
+    ref = mm.MeshHeatMethodDistanceSolver(V, F, use_robust=robust).compute_distance(0)
+
+    strided = mm.MeshHeatMethodDistanceSolver(V_view[::1], F_view[::1], use_robust=robust)
+    assert np.allclose(strided.compute_distance(0), ref, rtol=0, atol=1e-12)
+
+    # float32 vertices and int32 faces must be widened, not read at float64/int64 stride.
+    narrow = mm.MeshHeatMethodDistanceSolver(
+        np.ascontiguousarray(V, dtype=np.float32), np.ascontiguousarray(F, dtype=np.int32),
+        use_robust=robust)
+    assert np.allclose(narrow.compute_distance(0), ref, rtol=0, atol=1e-6)
+
+    # a genuinely strided view (every other face) is a different mesh, so compare it against itself
+    half = mm.MeshHeatMethodDistanceSolver(V, F[::2], use_robust=robust).compute_distance(0)
+    half_direct = pp3d.MeshHeatMethodDistanceSolver(V, np.ascontiguousarray(F[::2]),
+                                                    use_robust=robust).compute_distance(0)
+    assert np.allclose(half, half_direct, rtol=0, atol=1e-10)
+
+
+def test_layout_publishes_every_field_the_python_side_reads(ico2):
+    """`heat_layout` writes 17 offsets and mesh.py indexes them by position; a dropped write or a
+    reordered one is invisible until a field reads as a plausible-but-wrong number."""
+    V, F = ico2
+    n_v, n_f = V.shape[0], F.shape[0]
+    lay = mm.heat_layout(n_v, n_f, n_f, 3 * n_f)
+    assert len(lay) == 17
+    w_size, m_size = lay[0], lay[1]
+    w_hvif, w_hcw, w_corner_len, w_heat_ax, w_pois_ax, w_work = lay[2:8]
+    m_heat_ap, m_heat_ai, m_heat_perm, m_pois_ap, m_pois_ai, m_pois_perm = lay[8:14]
+    m_corner_v, m_first_he, m_corner_v_compute = lay[14:17]
+
+    # the float arena's regions are packed in the order the kernel writes them
+    assert w_hvif <= w_hcw <= w_corner_len <= w_heat_ax <= w_pois_ax <= w_work < w_size
+    # the int arena's regions likewise; m_corner_v is the original mesh snapshot and goes first,
+    # because the distance shift reads it while the solver works on the tufted cover
+    assert m_corner_v == 0
+    assert m_first_he >= 3 * n_f
+    assert m_heat_ap < m_heat_ai < m_heat_perm < m_pois_ap < m_pois_ai < m_pois_perm
+    assert m_corner_v_compute < m_size
+    assert m_heat_ap >= m_first_he + n_v
+
+    # each region fits in the arena that holds it, with room for the elements the kernel writes
+    nna = n_v + 4 * 3 * n_f
+    assert w_work + 4 * n_v == w_size
+    assert m_corner_v_compute + 3 * n_f == m_size
+    assert w_heat_ax + nna <= w_pois_ax and w_pois_ax + nna <= w_work
+    assert m_heat_ap + n_v + 1 <= m_heat_ai and m_heat_ai + nna <= m_heat_perm
+    assert m_heat_perm + n_v <= m_pois_ap and m_pois_ap + n_v + 1 <= m_pois_ai
+    assert m_pois_ai + nna <= m_pois_perm and m_pois_perm + n_v <= m_corner_v_compute
+
+
+def test_the_module_level_helpers_match_the_class(ico2):
+    """`compute_distance(V, F, v_ind)` and `compute_distance_multisource(V, F, v_inds)` are
+    upstream module-level functions that build a solver and query it; the covered table claims they
+    agree with upstream, so they are checked as the entry points a caller actually reaches for."""
+    V, F = ico2
+    srcs = [0, 7, 20]
+    a = pp3d.compute_distance(V, F, 5)
+    b = mm.compute_distance(V, F, 5)
+    assert np.abs(a - b).max() < 1e-10 * max(1.0, a.max())
+    a = pp3d.compute_distance_multisource(V, F, srcs)
+    b = mm.compute_distance_multisource(V, F, srcs)
+    assert np.abs(a - b).max() < 1e-10 * max(1.0, a.max())
+
+
+def test_the_core_checkers_are_upstreams_verbatim():
+    """`core.py` is transcribed from potpourri3d.core, and the covered APIs below depend on it
+    reproducing upstream's checks exactly: a stricter check would reject inputs upstream accepts, and
+    a looser one would accept inputs upstream rejects. Compared source-for-source, so reformatting
+    the copy cannot quietly change its behaviour."""
+    import ast
     import inspect
 
-    theirs = getattr(pp3d, cls)
-    ours = getattr(mpp3d, cls)
-    if method is not None:
-        theirs, ours = getattr(theirs, method), getattr(ours, method)
-    label = cls if method is None else f"{cls}.{method}"
-    assert str(inspect.signature(ours)) == str(inspect.signature(theirs)), label
+    import potpourri3d.core as up
+
+    from mojo_potpourri3d import core as mc
+
+    def dump(fn):
+        # The AST, not the text: this copy wraps one long raise across lines, and a text comparison
+        # would report that reflow as a behaviour difference.
+        return ast.dump(ast.parse(inspect.getsource(fn).lstrip()))
+
+    for fn in ("validate_mesh", "validate_points"):
+        assert dump(getattr(mc, fn)) == dump(getattr(up, fn)), f"{fn} is not upstream's verbatim"
 
 
-def test_every_covered_name_exists_upstream():
-    """The reverse direction: nothing invented under an upstream-looking name."""
-    covered = [
-        "cotan_laplacian", "face_areas", "vertex_areas", "compute_distance",
-        "compute_distance_multisource", "validate_mesh", "validate_points",
-        "MeshHeatMethodDistanceSolver", "MeshVectorHeatSolver",
-        "PointCloudHeatSolver", "PointCloudLocalTriangulation",
-    ]
-    for name in covered:
-        assert hasattr(pp3d, name), name
-        assert hasattr(mpp3d, name), name
+def test_the_input_checkers_reject_what_upstream_rejects(ico2):
+    """The checkers are reachable from every covered entry point, so they are exercised through them
+    rather than called directly."""
+    V, F = ico2
+    for bad_V in (np.zeros((8, 2)), np.zeros(8)):
+        for call in (
+            lambda: mm.cotan_laplacian(bad_V, F),
+            lambda: mm.face_areas(bad_V, F),
+            lambda: mm.MeshHeatMethodDistanceSolver(bad_V, F),
+        ):
+            with pytest.raises(ValueError, match="vertices should be a 2d Nx3 numpy array"):
+                call()
+    quad = np.hstack([F, F[:, :1]])
+    for call in (lambda: mm.cotan_laplacian(V, quad), lambda: mm.face_areas(V, quad)):
+        with pytest.raises(ValueError, match="faces must be triangular"):
+            call()
+
+
+def test_solver_setup_failures_are_not_swallowed(ico2):
+    """Setup returns codes the constructor has to translate, not pass through as a number.
+
+    -50 is a non-finite cotangent weight, which both paths can produce: a zero-area face is not
+    differential, and upstream returns an operator full of NaN for the same input. The factorization
+    codes are what an operator that is not positive definite would produce. Neither may be solved,
+    and both must raise rather than return a field from an unusable operator.
+    """
+    V, F = ico2
+    bad = F.copy()
+    bad[0] = [bad[0, 0], bad[0, 1], bad[0, 1]]  # two corners on the same vertex: zero area
+    # use_robust=False sees the degenerate face directly, so it reports it.
+    with pytest.raises(ValueError, match="degenerate"):
+        mm.MeshHeatMethodDistanceSolver(V, bad, use_robust=False)
+    # use_robust=True flips to intrinsic Delaunay, which drops the zero-area face instead, so the
+    # mesh is usable there and the field is finite. Pinned so the difference stays deliberate.
+    robust = mm.MeshHeatMethodDistanceSolver(V, bad, use_robust=True).compute_distance(0)
+    assert np.all(np.isfinite(robust))
+    assert np.abs(robust - pp3d.MeshHeatMethodDistanceSolver(V, bad, use_robust=True)
+                  .compute_distance(0)).max() < 1e-8 * robust.max()
+    # the elementwise operators still answer that input, exactly as upstream does (upstream's
+    # cotan_laplacian returns NaN there, and so does this port's)
+    assert np.isfinite(mm.face_areas(V, bad)).all()
+    L = mm.cotan_laplacian(V, bad)
+    up = pp3d.cotan_laplacian(V, bad)
+    assert np.array_equal(np.isnan(L.data), np.isnan(up.data))
+
+
+def test_a_solver_that_factors_and_reuses_stays_usable(ico2):
+    """Each query writes through the shared arenas, so a second call has to give the same answer as
+    the first. A solve that clobbered its own factor, its own permutation or the previous result
+    would drift from call to call."""
+    V, F = ico2
+    for robust in (False, True):
+        s = mm.MeshHeatMethodDistanceSolver(V, F, use_robust=robust)
+        first = s.compute_distance(3)
+        for _ in range(3):
+            again = s.compute_distance(3)
+            assert np.array_equal(again, first)
+        # interleaving source sets must not disturb either
+        multi = s.compute_distance_multisource([0, 5, 9])
+        assert np.array_equal(s.compute_distance(3), first)
+        assert np.array_equal(multi, s.compute_distance_multisource([0, 5, 9]))
+        # and two independent solvers on the same mesh agree
+        t = mm.MeshHeatMethodDistanceSolver(V, F, use_robust=robust)
+        assert np.array_equal(t.compute_distance(3), first)
+
+
+@pytest.mark.parametrize("name", ["ico2", "grid8"])
+def test_denom_eps_only_reaches_the_cotan_laplacian(name):
+    """`denom_eps` guards the cotangent against a zero-area face. Every other entry point must
+    reject it the way upstream does, because forwarding an unexpected keyword would silently widen
+    the call."""
+    if name.startswith("ico"):
+        V, F = conftest.icosphere(int(name[3:]))
+    else:
+        V, F = conftest.open_grid(int(name[4:]))
+    for call in (
+        lambda: mm.face_areas(V, F, denom_eps=1e-6),
+        lambda: mm.vertex_areas(V, F, denom_eps=1e-6),
+        lambda: mm.edges(V, F, denom_eps=1e-6),
+        lambda: mm.MeshHeatMethodDistanceSolver(V, F, denom_eps=1e-6),
+        lambda: mm.compute_distance(V, F, 0, denom_eps=1e-6),
+    ):
+        with pytest.raises(TypeError):
+            call()

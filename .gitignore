@@ -1,8 +1,15 @@
-.pixi/
+# build output
 dist/
+.pixi/
 build/*.o
-__pycache__/
+# `mojo build` drops a link artefact named after the entry point next to the sources
+core
 *.so
+# python
+__pycache__/
 *.pyc
 .pytest_cache/
+.mypy_cache/
+.coverage
+*.egg-info/
 .venv/

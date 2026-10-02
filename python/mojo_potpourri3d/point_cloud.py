@@ -1,85 +1,130 @@
-"""`potpourri3d.point_cloud`, with the local triangulation and the heat-method
-distance solver backed by the Mojo kernels. Names, argument order and defaults
-are upstream's.
+"""potpourri3d.point_cloud, with the compute served by the Mojo kernels.
 
-`PointCloudHeatSolver` builds the same chain upstream does: the local Delaunay
-triangulation of every neighbourhood (`PointCloudLocalTriangulation`), the flat
-triangle list it hands back, then the same mollify / tufted-cover / flip-to-
-Delaunay passes a mesh goes through for the robust Laplacian, and finally the
-heat method on that cover. The cover is intrinsic data, so the solver is
-constructed from edge lengths rather than from positions.
+Names, argument order, defaults and the ValueError checks match upstream, so this is a drop-in
+replacement for the covered subset.
+
+Covered: `PointCloudLocalTriangulation.get_local_triangulation` and
+`PointCloudHeatSolver.get_tangent_frames`. Names, argument order, defaults and the ValueError
+checks match upstream.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from ._lib import addr, f64, lib
-from ._heat import HeatMethodDistanceSolver
-from ._solver import HalfedgeMesh, IntrinsicGeometry
-from ._tufted import tufted_intrinsic_mesh
 from .core import *
+from ._lib_pointcloud import addr, dll, f64, geometry_layout, i64, max_neighs_of, n_triangles_of
 
-# `PointPositionGeometry::kNeighborSize`
+# PointPositionGeometry::kNeighborSize
 K_NEIGHBOR_SIZE = 30
 
-# `computeTuftedTriangulation` mollifies with this factor
-MOLLIFY_FACTOR = 1e-5
-
-_NOT_COVERED = (
-    "not covered by this port; see the coverage table in the README"
-)
+__all__ = ["K_NEIGHBOR_SIZE", "PointCloudHeatSolver", "PointCloudLocalTriangulation"]
 
 
-class PointCloudLocalTriangulation:
-    """`geometrycentral::pointcloud::PointCloudLocalTriangulation`."""
+class _Geometry:
+    """PointPositionGeometry's quantities: neighbours, frames, tangent coordinates, triangulation."""
 
     def __init__(self, P, with_degeneracy_heuristic=True):
         validate_points(P)
-        self.P = f64(P)
+        P = f64(P)
+        self.P = P
+        self.n_points = int(P.shape[0])
+        self.n_neighbors = K_NEIGHBOR_SIZE
         self.with_degeneracy_heuristic = bool(with_degeneracy_heuristic)
-        n = self.P.shape[0]
-        # A point cloud of fewer than k+1 points has fewer neighbours than k.
-        self.k = min(K_NEIGHBOR_SIZE, max(n - 1, 1))
 
-        self.neighbors = np.zeros(n * self.k, dtype=np.int64)
-        keys = np.zeros(self.k, dtype=np.float64)
-        vals = np.zeros(self.k, dtype=np.int64)
-        lib().mpp3d_pc_neighbors(
-            addr(self.P), n, self.k, addr(self.neighbors), addr(keys), addr(vals)
+        lay = geometry_layout(self.n_points, self.n_neighbors)
+        self._lay = lay
+        self._W = np.zeros(lay["w_size"], dtype=np.float64)
+        self._M = np.zeros(lay["m_size"], dtype=np.int64)
+        rc = dll().pp3d_pc_prepare(
+            self.n_points, self.n_neighbors, int(self.with_degeneracy_heuristic),
+            addr(P), addr(self._W), addr(self._M))
+        if rc != 0:
+            raise RuntimeError(f"point cloud geometry setup failed with code {rc}")
+
+        self.n_triangles = n_triangles_of(self._W)
+        self.max_neighs = max_neighs_of(self._W)
+
+    def local_triangles(self):
+        """The local triangulation as a flat (n_triangles, 3) array of point indices."""
+        o = self._lay["m_tri"]
+        tris = self._M[o:o + 3 * self.n_triangles]
+        return tris.reshape(self.n_triangles, 3).astype(np.int64)
+
+    def triangle_counts(self):
+        o = self._lay["m_tri_off"]
+        return np.diff(self._M[o:o + self.n_points + 1]).astype(np.int64)
+
+
+class PointCloudHeatSolver:
+    """potpourri3d.PointCloudHeatSolver.
+
+    Only `get_tangent_frames` is covered, because it is the only entry point that does not need the
+    heat operator, and every heat operator on a point cloud goes through a mesh this port cannot
+    build. Upstream turns the local triangulation into a geometry-central *general* SurfaceMesh, whose
+    edges carry more than two halfedges: on a 300-point sphere, 794 of its 927 edges carry six. The
+    intrinsic tufted cover that the robust heat method needs is then built with `separateToNewEdge`,
+    which that mesh type has and this port's manifold-only corner array (one twin pair per edge, a
+    self-twin for a boundary edge) cannot represent. Rather than return a field that is one to twenty
+    percent away from upstream's, the methods that need the operator raise. See the coverage section
+    of the README.
+    """
+
+    _NEEDS_OPERATOR = (
+        "needs the point cloud's intrinsic tufted cover, which this port does not build; see the "
+        "coverage section of the README"
+    )
+
+    def __init__(self, P, t_coef=1.0):
+        self._geom = _Geometry(P, with_degeneracy_heuristic=True)
+        self.n_points = self._geom.n_points
+        self.t_coef = float(t_coef)
+
+    def get_tangent_frames(self):
+        """(basisX, basisY, normal) per point, each an (n_points, 3) array, as upstream returns."""
+        o = self._geom._lay["w_normals"]
+        normals = self._geom._W[o:o + 3 * self.n_points].reshape(self.n_points, 3).copy()
+        o = self._geom._lay["w_basis"]
+        basis = self._geom._W[o:o + 6 * self.n_points].reshape(self.n_points, 6)
+        return basis[:, :3].copy(), basis[:, 3:].copy(), normals
+
+    def compute_distance(self, p_ind):
+        raise NotImplementedError(f"compute_distance {self._NEEDS_OPERATOR}")
+
+    def compute_distance_multisource(self, p_inds):
+        raise NotImplementedError(f"compute_distance_multisource {self._NEEDS_OPERATOR}")
+
+    def extend_scalar(self, p_inds, values):
+        if len(p_inds) != len(values):
+            raise ValueError("source point indices and values array should be same shape")
+        raise NotImplementedError(f"extend_scalar {self._NEEDS_OPERATOR}")
+
+    def transport_tangent_vector(self, p_ind, vector):
+        if len(vector) != 2:
+            raise ValueError("vector should be a 2D tangent vector")
+        raise NotImplementedError(f"transport_tangent_vector {self._NEEDS_OPERATOR}")
+
+    def transport_tangent_vectors(self, p_inds, vectors):
+        if len(p_inds) != len(vectors):
+            raise ValueError("source point indices and values array should be same length")
+        raise NotImplementedError(f"transport_tangent_vectors {self._NEEDS_OPERATOR}")
+
+    def compute_log_map(self, p_ind):
+        raise NotImplementedError(f"compute_log_map {self._NEEDS_OPERATOR}")
+
+    def compute_signed_distance(self, curves, cloud_normals, preserve_source_normals=False,
+                                level_set_constraint="ZeroSet", soft_level_set_weight=-1):
+        raise NotImplementedError(
+            "compute_signed_distance needs a level-set solve on the sign function, which is out of "
+            "scope for this port; see the coverage section of the README"
         )
 
-        self.normals = np.zeros(3 * n, dtype=np.float64)
-        a = np.zeros(9, dtype=np.float64)
-        v = np.zeros(9, dtype=np.float64)
-        lib().mpp3d_pc_normals(
-            addr(self.P), addr(self.neighbors), n, self.k, addr(self.normals),
-            addr(a), addr(v),
-        )
 
-        self.tangent_coordinates = np.zeros(2 * n * self.k, dtype=np.float64)
-        lib().mpp3d_pc_tangent_coordinates(
-            addr(self.P), addr(self.normals), addr(self.neighbors), n, self.k,
-            addr(self.tangent_coordinates),
-        )
+class PointCloudLocalTriangulation:
+    """potpourri3d.PointCloudLocalTriangulation."""
 
-    def _build(self):
-        """The flat triangle list, `handleToFlatInds`."""
-        n = self.P.shape[0]
-        k = self.k
-        # A point's star is a fan over its angularly sorted neighbours, so it
-        # has at most k triangles.
-        tri = np.zeros(3 * n * k, dtype=np.int64)
-        offsets = np.zeros(n + 1, dtype=np.int64)
-        pts = np.zeros(2 * k, dtype=np.float64)
-        angles = np.zeros(k, dtype=np.float64)
-        sort_inds = np.zeros(k, dtype=np.int64)
-        total = lib().mpp3d_pc_local_triangulation(
-            addr(self.tangent_coordinates), addr(self.neighbors), n, k,
-            1 if self.with_degeneracy_heuristic else 0, addr(tri), addr(offsets),
-            addr(pts), addr(angles), addr(sort_inds),
-        )
-        return tri[:total], offsets
+    def __init__(self, P, with_degeneracy_heuristic=True):
+        self._geom = _Geometry(P, with_degeneracy_heuristic=with_degeneracy_heuristic)
 
     def get_local_triangulation(self):
         """Return the local point cloud triangulation
@@ -89,73 +134,27 @@ class PointCloudLocalTriangulation:
             out[point_idx, neigh_idx, :] are the indices of the 3 neighbors
             -1 is used as the fill value for unused elements if num_neighs < max_neighs for a point
         """
-        tri, offsets = self._build()
-        n = self.P.shape[0]
-        counts = (offsets[1:] - offsets[:-1]) // 3
-        max_neighs = int(counts.max()) if n else 0
+        tris = self._geom.local_triangles()
+        counts = self._geom.triangle_counts()
+        n = self._geom.n_points
+        max_neighs = int(counts.max()) if counts.size else 0
         out = np.full((n, max_neighs, 3), -1, dtype=np.int64)
-        for p in range(n):
-            c = int(counts[p])
-            out[p, :c] = tri[offsets[p] : offsets[p] + 3 * c].reshape(c, 3)
+        if max_neighs == 0 or tris.shape[0] == 0:
+            return out
+        # The ragged per-point run lengths become a gather index, so the kernel's flat triangle
+        # list is scattered once and the -1 padding is written by np.full rather than by a Python
+        # loop over the points.
+        rows = np.repeat(np.arange(n, dtype=np.int64), counts)
+        cols = _within(counts)
+        out[rows, cols] = tris
         return out
 
-    def flat_triangles(self):
-        """`handleToFlatInds`: every point's triangles, concatenated."""
-        tri, _ = self._build()
-        return tri
 
-
-class PointCloudHeatSolver:
-    """`PointCloudHeatSolver`: heat-method distance on a point cloud."""
-
-    def __init__(self, P, t_coef=1.0):
-        validate_points(P)
-        self.P = f64(P)
-        self.t_coef = t_coef
-        n = self.P.shape[0]
-
-        # `requireTuftedTriangulation`: local triangulation, then the same
-        # intrinsic preprocessing a mesh gets for the robust Laplacian.
-        self.local_triangulation = PointCloudLocalTriangulation(
-            P, with_degeneracy_heuristic=True
-        )
-        F = self.local_triangulation.flat_triangles().reshape(-1, 3)
-        F_tufted, twins, edge_lengths, self.n_flips = tufted_intrinsic_mesh(
-            F, self.P, n, MOLLIFY_FACTOR
-        )
-        self.mesh = HalfedgeMesh(F_tufted, n, twins)
-        self.geom = IntrinsicGeometry.from_edge_lengths(self.mesh, edge_lengths)
-        self.solver = HeatMethodDistanceSolver(self.mesh, self.geom, t_coef)
-
-    def compute_distance(self, p_ind):
-        return self.solver.compute_distance(p_ind)
-
-    def compute_distance_multisource(self, p_inds):
-        return self.solver.compute_distance(p_inds)
-
-    def extend_scalar(self, p_inds, values):
-        if len(p_inds) != len(values):
-            raise ValueError("source point indices and values array should be same shape")
-        raise NotImplementedError(_NOT_COVERED)
-
-    def get_tangent_frames(self):
-        raise NotImplementedError(_NOT_COVERED)
-
-    def transport_tangent_vector(self, p_ind, vector):
-        if len(vector) != 2:
-            raise ValueError("vector should be a 2D tangent vector")
-        raise NotImplementedError(_NOT_COVERED)
-
-    def transport_tangent_vectors(self, p_inds, vectors):
-        if len(p_inds) != len(vectors):
-            raise ValueError("source point indices and values array should be same length")
-        raise NotImplementedError(_NOT_COVERED)
-
-    def compute_log_map(self, p_ind):
-        raise NotImplementedError(_NOT_COVERED)
-
-    def compute_signed_distance(
-        self, curves, cloud_normals, preserve_source_normals=False,
-        level_set_constraint="ZeroSet", soft_level_set_weight=-1,
-    ):
-        raise NotImplementedError(_NOT_COVERED)
+def _within(counts):
+    """Concatenated arange(c) for each c, the position of each triangle within its point."""
+    total = int(counts.sum())
+    if total == 0:
+        return np.zeros(0, dtype=np.int64)
+    ends = np.cumsum(counts)
+    starts = ends - counts
+    return np.arange(total, dtype=np.int64) - np.repeat(starts, counts)

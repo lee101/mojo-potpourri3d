@@ -1,413 +1,325 @@
 # mojo-potpourri3d
 
 A Mojo port of the compute-bound parts of [potpourri3d](https://github.com/nmwsharp/potpourri3d):
-geodesic distance by the heat method, on meshes and on point clouds; tangent-vector
-transport; and the mesh Laplacians and triangulations they are built on.
+the heat method for geodesic distance, the intrinsic tufted Laplacian behind its robust default,
+the cotangent Laplacian and mesh areas, the point cloud's local triangulation and tangent frames,
+and the sparse symmetric solver that backs them.
 
-The Python API is upstream's -- same module layout, same class and function names,
-same argument order and defaults -- so it is a drop-in for the covered subset.
-`tests/test_parity.py` asserts the signatures match upstream's exactly, and
-asserts the numbers do too.
+The Python API mirrors upstream's names, argument order and defaults, so the covered subset is a
+drop-in replacement. The kernels are transcribed from the C++ the installed upstream wheel is built
+from (geometry-central at commit `30fd34d`, the submodule pin of `potpourri3d` v1.4.0), and the
+results are asserted against that wheel in the test suite.
 
-## Usage
+## What this is
 
-    import numpy as np
-    import mojo_potpourri3d as pp3d
-
-    V, F = pp3d.read_mesh("bunny.ply")   # not covered; bring your own loader
-    d = pp3d.compute_distance(V, F, 0)   # heat-method distance to vertex 0
-
-This block runs as written on the icosahedron built inline below
-(`tests/test_readme_example.py` executes it, so it cannot rot):
-
-    import numpy as np
-    import mojo_potpourri3d as pp3d
-
-    t = (1 + 5 ** 0.5) / 2
-    V = np.array([[-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0],
-                  [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t],
-                  [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]], float)
-    F = np.array([[0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
-                  [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
-                  [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
-                  [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]])
-    V /= np.linalg.norm(V, axis=1, keepdims=True)      # unit icosahedron
-
-    d = pp3d.compute_distance(V, F, 0)                 # (12,) distances
-    s = pp3d.MeshHeatMethodDistanceSolver(V, F, use_robust=False)
-    dm = s.compute_distance_multisource([0, 3])        # (12,) multi-source
-    L = pp3d.cotan_laplacian(V, F)                     # (12, 12) csr_matrix
-
-    vs = pp3d.MeshVectorHeatSolver(V, F, use_intrinsic_delaunay=False)
-    bX, bY, n = vs.get_tangent_frames()                # (12, 3) each
-    C = vs.get_connection_laplacian()                  # (12, 12) complex system
-    u = vs.transport_tangent_vector(0, [1.0, 0.0])      # (12, 2) transported
-    h = vs.extend_scalar([0, 3], [1.0, 1.0])           # (12,) extended
-
-    P = np.random.default_rng(0).normal(size=(300, 3))  # a point cloud
-    P /= np.linalg.norm(P, axis=1, keepdims=True)
-    pc = pp3d.PointCloudHeatSolver(P)
-    pd = pc.compute_distance(0)                        # (300,) distances
-    tri = pp3d.PointCloudLocalTriangulation(P).get_local_triangulation()
-
-`d[0]` is 0, the unit-icosahedron's antipodal distance comes out at ~2.732 (the
-true geodesic is pi = 3.1416, so this is the usual heat-method underestimate on a
-mesh this coarse), `abs(L @ ones).max()` is ~1e-15, and every row of `u` has
-unit norm to ~1e-16. `use_intrinsic_delaunay` is set to `False` only because this
-port does not cover the intrinsic-Delaunay preprocessing; see the coverage table.
-`compute_distance` above is the module-level one, which takes no flags and so runs
-the robust Laplacian, as upstream does.
+potpourri3d is a pybind11 wrapper over a fork of geometry-central. The algorithms live in C++
+(`heat_method_distance.cpp`, `vector_heat_method.cpp`, `tufted_laplacian.cpp`, `simple_idt.cpp`,
+`local_triangulation.cpp`, `positive_definite_solvers.cpp`, …) and the linear algebra is CHOLMOD or
+Eigen's `SimplicialLDLT`. This repo reimplements that layer in Mojo and exposes it over a fixed-ABI
+shared library driven by ctypes. The source files mirror the upstream files one for one and in
+upstream order, so the two can be read side by side.
 
 ## Install
 
-    pixi install
-    pixi run build     # mojo build --emit shared-lib -> dist/libmojo-potpourri3d.so
-    pixi run test
-    pixi run bench
+The toolchain is pinned in `pixi.toml`: Mojo `1.2.0.dev2026092905` with the matching `max`
+`26.7.0.dev2026092905`, on Linux x86-64.
 
-`pixi install` pulls the pinned Mojo toolchain, NumPy, SciPy and upstream
-`potpourri3d` itself (from PyPI, which is the only place a CPython 3.13 wheel
-exists; conda-forge only builds it for 3.11).
+```
+pixi install
+pixi run build     # mojo build --emit shared-lib -I src src/ported.mojo -o dist/libmojo-potpourri3d.so
+pixi run test
+pixi run bench     # takes a machine-wide lock; always benchmark through this
+```
 
-## What is covered
+`pixi run build` is one compilation unit over all of `src/`, and it takes a few seconds. The Python
+package is picked up from `python/` via the `PYTHONPATH` in `pixi.toml`; there is nothing to install
+beyond `pixi install`. Upstream `potpourri3d` 1.4.0 comes from PyPI as a dependency and is what the
+test suite compares against — it is needed to run the tests and the benchmarks, not to use the
+library.
 
-| upstream | status |
-| --- | --- |
-| `cotan_laplacian(V, F, denom_eps=0.)` | exact parity |
-| `face_areas(V, F)` | exact parity |
-| `vertex_areas(V, F)` | exact parity |
-| `MeshHeatMethodDistanceSolver.compute_distance` | exact parity, robust and plain |
-| `MeshHeatMethodDistanceSolver.compute_distance_multisource` | exact parity |
-| `compute_distance`, `compute_distance_multisource` | exact parity |
-| `MeshVectorHeatSolver.extend_scalar` | exact parity |
-| `MeshVectorHeatSolver.get_tangent_frames` | exact parity |
-| `MeshVectorHeatSolver.get_connection_laplacian` | exact parity |
-| `MeshVectorHeatSolver.transport_tangent_vector(s)` | exact parity except one vertex (see below) |
-| `PointCloudLocalTriangulation.get_local_triangulation` | same triangles, rotated order (see below) |
-| `PointCloudHeatSolver.compute_distance` | same pipeline, agrees to a fraction of a percent |
-| `PointCloudHeatSolver.compute_distance_multisource` | same |
-| `validate_mesh`, `validate_points` | verbatim from upstream |
+## Usage
 
-The robust Laplacian (`use_robust=True`, which is upstream's *default* for the
-distance solver) is the real thing: `buildIntrinsicTuftedCover`,
-`mollifyIntrinsic` and `flipToDelaunay` are ported, and the distances agree with
-upstream's robust distances to 1e-15 relative. `test_robust_path_runs_the_delaunay_flips`
-perturbs an icosphere so the flip pass has 1169 flips to do and pins the parity
-through them.
+```python
+import numpy as np
+from mojo_potpourri3d.mesh import (
+    MeshHeatMethodDistanceSolver,
+    cotan_laplacian,
+    face_areas,
+    vertex_areas,
+)
 
-### What is not covered, and why
+# a unit icosphere: 12 vertices, 20 faces
+t = (1.0 + 5.0**0.5) / 2.0
+V = np.array([[-1,t,0],[1,t,0],[-1,-t,0],[1,-t,0],[0,-1,t],[0,1,t],
+              [0,-1,-t],[0,1,-t],[t,0,-1],[t,0,1],[-t,0,-1],[-t,0,1]], dtype=np.float64)
+V /= np.linalg.norm(V, axis=1, keepdims=True)
+F = np.array([[0,11,5],[0,5,1],[0,1,7],[0,7,10],[0,10,11],[1,5,9],[5,11,4],
+              [11,10,2],[10,7,6],[7,1,8],[3,9,4],[3,4,2],[3,2,6],[3,6,8],
+              [3,8,9],[4,9,5],[2,4,11],[6,2,10],[8,6,7],[9,8,1]], dtype=np.int64)
 
-* **The emitted order of a point cloud's local triangulation.** The triangles
-  themselves are upstream's, exactly, for every point of every non-degenerate
-  cloud tested (sphere, scaled sphere, torus; see
-  `test_local_triangulation_matches_upstream`). The *order* is not, and it is
-  not reproducible. Upstream emits a point's triangles in angular order around
-  the centre, in a tangent frame built from a normal that comes from Eigen's
-  `JacobiSVD` on the 3 x k neighbourhood matrix. The normal this port computes
-  -- the smallest eigenvector of the 3x3 Gram matrix, by cyclic Jacobi
-  rotations -- agrees with LAPACK's `eigh` on the same matrix to 2e-6 degrees,
-  but not with the SVD, and the angular order only has to be off by a
-  thousandth of a radian for the `-pi` cut to fall between different
-  neighbours. Reproducing the order would mean reproducing Eigen's SVD
-  operation for operation, which is not a port, it is a copy.
+solver = MeshHeatMethodDistanceSolver(V, F)          # use_robust=True is upstream's default
+d = solver.compute_distance(0)                       # shape (12,), d[0] == 0
+d_multi = solver.compute_distance_multisource([0, 1])  # distance to the nearer source
 
-  This is not cosmetic downstream: `buildIntrinsicTuftedCover` glues the cover
-  in the order the faces arrive, so a rotated emission order gives a different
-  (equally valid) Delaunay triangulation of the cover, and hence a slightly
-  different heat operator. Measured on 200- and 600-point clouds, the distance
-  field agrees with upstream's to 0.25% median and 2.4% worst case, with
-  correlation above 0.9999. `test_point_cloud_distance_agrees_with_upstream`
-  pins that bound rather than pretending to roundoff parity.
+L = cotan_laplacian(V, F)                            # scipy CSR, same as upstream
+a = face_areas(V, F)
+m = vertex_areas(V, F)                               # lumped mass
+```
 
-* **Exactly cocircular neighbourhoods.** With one, the in-circle determinant is
-  mathematically zero and its computed sign is rounding noise, so the
-  degeneracy heuristic decides nothing and the fan is kept or dropped by
-  luck. Upstream's own test cloud, the "cartwheel" (a centre point on a ring of
-  30), is exactly this: upstream keeps the full 30-triangle fan, this port
-  keeps none of it. `test_cartwheel_ring_is_cocircular` pins the divergence
-  rather than hiding it. `inCircleTest` itself is a faithful transcription of
-  Eigen's six-term 4x4 cofactor expansion, so this is the input perturbation
-  and not a different predicate.
+The point cloud side:
 
-* **The point cloud vector-heat methods** -- `extend_scalar`,
-  `get_tangent_frames`, `transport_tangent_vector(s)`, `compute_log_map`,
-  `compute_signed_distance`. They need the point cloud's *extrinsic* tangent
-  frames and the vertex connection Laplacian built from the parallel transport
-  between them (`computeConnectionLaplacian`, `transportBetweenOriented`), which
-  is a different set of kernels from the mesh ones. They are present and raise
-  `NotImplementedError`.
+```python
+import numpy as np
+import potpourri3d as pp3d
+from mojo_potpourri3d.point_cloud import PointCloudLocalTriangulation, PointCloudHeatSolver
 
-* **`MeshVectorHeatSolver.compute_log_map`.** Raises `NotImplementedError`. All
-  three strategies (`VectorHeat`, `AffineLocal`, `AffineAdaptive`) end in a
-  factorization of a singular or indefinite operator -- the affine connection
-  heat operator for the two affine strategies, the unshifted cotan Laplacian for
-  `VectorHeat` -- which upstream hands to Eigen's `SparseLU` with partial
-  pivoting. This port has a serial LDL^T with a pivot floor, and on those
-  operators it returns a visibly different answer. Rather than ship a wrong
-  number, the method raises and says so.
+P = np.random.default_rng(0).standard_normal((300, 3))
+P /= np.linalg.norm(P, axis=1, keepdims=True)
 
-* **`use_intrinsic_delaunay=True`** on the vector heat solver. That flag runs a
-  Delaunay flip pass on the *mesh* to build an intrinsic triangulation for the
-  connection Laplacian, upstream via `IntrinsicTriangulation` and
-  `IntegerCoordinatesIntrinsicTriangulation`; the simple-IDT flipper here is
-  the one the heat method uses, which is not the same operator. The flag is
-  accepted and stored and the extrinsic path is run, so passing `True` or
-  `False` gives bit-identical results here. Parity is asserted with
-  `use_intrinsic_delaunay=False`, the configuration that isolates the solver
-  from that preprocessing.
+tri = PointCloudLocalTriangulation(P).get_local_triangulation()   # (300, max_neighs, 3), -1 padded
+X, Y, N = PointCloudHeatSolver(P).get_tangent_frames()           # three (300, 3) frames
+```
 
-* **One vertex of `transport_tangent_vector`.** On a sphere, the vertex directly
-  opposite the source is the antipode, where the transported direction is
-  numerically degenerate; normalizing there amplifies rounding until the sign
-  flips. Every other vertex agrees to 1e-9. `test_transport_tangent_vector_matches_except_the_antipode`
-  asserts exactly that: at most one vertex may differ, and all others must agree.
+For the covered subset, `import potpourri3d as pp3d` and the call sites transfer unchanged. Read the
+coverage section before you rely on a name being here: the methods that are not covered raise rather
+than return numbers that would not match upstream.
 
-* **The brute-force nearest-neighbour search.** `NearestNeighborFinder` is a
-  nanoflann KD-tree; here it is a partial selection scan, O(n^2 k) instead of
-  O(n log n). The neighbour lists agree (ties broken by index), which
-  `test_local_triangulation_matches_upstream` checks indirectly, and it is why
-  the local triangulation row below is a loss.
+## Coverage
 
-* Everything else in `potpourri3d` -- signed heat, fast marching, marching
-  triangles, edge-flip geodesics, the geodesic tracer, the polygon-mesh solvers,
-  `read_mesh` / `write_mesh` -- is out of scope for this port and absent.
+### Covered, and asserted equal to upstream `potpourri3d` 1.4.0 in `pixi run test`
 
-## Fidelity
+Every "agreement" below is the worst relative error `max|a - b| / max|b|` over the meshes and clouds
+the named test covers, measured against the installed upstream wheel. Each row names the test that
+proves it.
 
-`src/mojopp3d/` is laid out to be read next to the geometry-central sources it
-comes from, in the same order, with the same function names:
+| API | measured agreement | test |
+|---|---|---|
+| `mojo_potpourri3d.mesh.cotan_laplacian(V, F, denom_eps=0.)` | 4e-16 | `test_cotan_laplacian_matches_upstream` |
+| `cotan_laplacian(V, F, denom_eps=...)` at `0.`, `1e-6`, `1e-2` | < 1e-12 | `test_cotan_laplacian_denom_eps` |
+| `mojo_potpourri3d.mesh.face_areas(V, F)` | 3e-16 (bit-exact on flat grids) | `test_face_areas_match_upstream` |
+| `mojo_potpourri3d.mesh.vertex_areas(V, F)` | 3e-16 | `test_vertex_areas_match_upstream` |
+| `mojo_potpourri3d.mesh.edges(V, F)` | identical edge set | `test_edges_match_upstream` |
+| `MeshHeatMethodDistanceSolver(..., use_robust=False)` | 4e-15, worst over **every** vertex of five meshes | `test_heat_distance_matches_upstream` |
+| `MeshHeatMethodDistanceSolver(..., use_robust=True)` | 3e-15 on closed meshes, 1.4e-09 on open ones | `test_heat_distance_robust_matches_upstream` |
+| `….compute_distance_multisource(v_inds)` | 2e-15 | `test_heat_distance_multisource_matches_upstream` |
+| `compute_distance(V, F, v_ind)` / `compute_distance_multisource(V, F, v_inds)` | < 1e-10 | `test_the_module_level_helpers_match_the_class` |
+| `PointCloudLocalTriangulation(P).get_local_triangulation()` | identical as a set of neighbour triples on every point of all five clouds | `test_local_triangulation_matches_upstream_as_a_set` |
+| `PointCloudHeatSolver(P).get_tangent_frames()` | 1e-14, up to the per-point normal sign | `test_tangent_frames_match_upstream_up_to_sign` |
+| `PointCloudLocalTriangulation(P, with_degeneracy_heuristic=False)` | identical set on every point sampled | `test_degeneracy_heuristic_off_is_accepted` |
+| `validate_mesh` / `validate_points` | upstream's source, compared as an AST | `test_the_core_checkers_are_upstreams_verbatim` |
+| the sparse symmetric `LDL^T` and its solve | 3e-15 against `scipy.sparse.linalg.spsolve` | `tests/test_sparse.py` |
 
-| file | upstream file |
-| --- | --- |
-| `vector.mojo` | `include/geometrycentral/utilities/vector{2,3}.{h,ipp}` |
-| `mesh.mojo` | `src/surface/surface_mesh.cpp` (the face-soup constructor) |
-| `general_mesh.mojo` | `src/surface/surface_mesh.cpp` (the general mesh: `duplicateFace`, `invertOrientation`, `separateToNewEdge`, `flip`) |
-| `tufted.mojo` | `src/surface/tufted_laplacian.cpp`, `src/surface/intrinsic_mollification.cpp`, `src/surface/simple_idt.cpp` |
-| `local_triangulation.mojo` | `src/pointcloud/local_triangulation.cpp`, `src/pointcloud/neighborhoods.cpp`, `src/pointcloud/point_position_geometry.cpp`, `src/utilities/elementary_geometry.cpp` |
-| `intrinsic_geometry.mojo` | `src/surface/intrinsic_geometry_interface.cpp` |
-| `embedded_geometry.mojo` | `src/surface/embedded_geometry_interface.cpp` |
-| `heat_method.mojo` | `src/surface/heat_method_distance.cpp` |
-| `vector_heat_method.mojo` | `src/surface/vector_heat_method.cpp` |
-| `linalg.mojo`, `sparse.mojo` | no upstream counterpart; replaces CHOLMOD |
-| `api.mojo` | `potpourri3d/mesh.py` (the NumPy free functions) |
-| `capi.mojo` | the `abi("C")` boundary, nothing else |
+`use_robust=True` is the upstream **default**: the intrinsic tufted Laplacian of [Sharp & Crane
+2020], where the mesh is doubled into its two-sheeted cover, mollified, and flipped to intrinsic
+Delaunay before the operators are built. `src/tufted_laplacian.mojo` and `src/simple_idt.mojo` port
+that path, and `HeatMethodDistanceSolver` calls it exactly as upstream does.
 
-The branch structure and the order of the arithmetic follow upstream statement by
-statement. Where a faithful port is impossible the divergence is listed above.
+Two behaviours are pinned because they are the kind that drift silently:
+
+- A query whose source index is outside `[0, nV)` raises `IndexError`, and an empty source list raises
+  `ValueError`. Upstream indexes its vertex array with the caller's list unchecked, so on those inputs upstream returns
+  whatever its allocator left there, which is not a field worth matching (`test_out_of_range_source_index_is_reported`,
+  `test_an_empty_source_set_is_reported`).
+- A zero-area face makes the cotangent weights non-finite, and both `use_robust` settings report it as
+  a `ValueError` rather than solving with a NaN operator. Upstream returns a NaN-filled operator for
+  `cotan_laplacian` on the same mesh (`test_solver_setup_failures_are_not_swallowed`).
+
+### Not covered
+
+Each entry names the function and the reason. Nothing here returns a plausible-but-wrong number: the
+method raises `NotImplementedError` with the reason.
+
+| API | why |
+|---|---|
+| `PointCloudHeatSolver.compute_distance`, `.compute_distance_multisource`, `.extend_scalar`, `.compute_log_map` | These go through `PointPositionGeometry::computeTuftedTriangulation`, which makes the local triangulation into a geometry-central **general** `SurfaceMesh` whose edges carry more than two halfedges — on a 300-point sphere, 794 of its 927 edges carry six. The intrinsic tufted cover the robust heat method needs is then built with `separateToNewEdge`, which that mesh type has and this port's mesh model does not: the flat corner array holds one twin pair per edge and a self-twin for a boundary edge, so the sheet assignment around a six-fold edge cannot be expressed. A port of that half of the solver was written and measured at 1-20% from upstream; it was removed rather than shipped, and the local triangulation it produced (which is exact) is what this port keeps. |
+| `PointCloudHeatSolver.transport_tangent_vector`, `.transport_tangent_vectors` | the same operator, plus the complex-Hermitian connection Laplacian. |
+| `PointCloudHeatSolver.compute_signed_distance` | a level-set solve on the sign function; out of scope. |
+| `MeshVectorHeatSolver` — all of `extend_scalar`, `get_tangent_frames`, `get_connection_laplacian`, `transport_tangent_vector`, `transport_tangent_vectors`, `compute_log_map` | Two separate blockers. (a) `compute_log_map` needs `ensureHaveAffineHeatSolver`'s 3N x 3N affine connection Laplacian, which is not symmetric even on a Delaunay mesh, so it needs a general sparse LU; `src/sparse.mojo` is a symmetric `LDL^T` and no LU is shipped. (b) The other five were specified and verified against upstream (to 1.5e-15, as a NumPy transcription of the same C++) but not ported before the budget ran out. Two shared-file bugs that blocked them are fixed and are worth knowing about either way: `src/sparse.mojo`'s complex path mirrored the off-diagonal value instead of its conjugate, so `w=2` factored a complex-**symmetric** matrix where the connection Laplacian is Hermitian; and the boundary "ghost" halfedges that upstream's `for (Halfedge he : mesh.halfedges())` iterates have no counterpart in this port's mesh model, so the connection Laplacian and the affine operator are each missing a mirrored term per boundary edge on an open mesh. |
+| `MeshSignedHeatSolver`, `PolygonMeshHeatSolver` | signed distance needs a level-set solve on the sign function; the polygon solver needs the tufted cover of a polygon mesh, which the manifold-only mesh model cannot build. |
+| `MeshFastMarchingDistanceSolver`, `marching_triangles`, `EdgeFlipGeodesicSolver`, `GeodesicTracer` | not heat method; out of scope. |
+| `MeshMarchingTrianglesSolver` | a polygon-mesh contouring solve; out of scope. |
+| `read_mesh`, `write_mesh`, `read_point_cloud`, `write_point_cloud`, `read_polygon_mesh`, `potpourri3d.io` | file I/O. Nothing here is compute-bound: this port has no reason to own them, and `point_cloud.py` and `mesh.py` re-export the names their own modules use. |
+
+### Documented divergences inside the covered set
+
+| where | what |
+|---|---|
+| `compute_distance_multisource` with sources at the three corners of one face | That face's heat values are equal, so its gradient is rounding noise, and upstream calls `normalizeCutoff()` with its default cutoff of zero — it divides by the noise and normalizes it to a unit vector. Which noise it gets depends on the last bit of its solver's output, which differs from this port's, so the two fields are a couple of percent apart on that input. This port keeps upstream's arithmetic exactly rather than papering over it; a cutoff was tried and rejected because the gradient genuinely passes through zero at critical points of the heat field, and cutting those changes well-resolved results by 3%. `tests/test_parity.py::test_multisource_at_the_corners_of_one_face` pins the size of the disagreement. |
+| `heat_method_distance.mojo` | The RHS region and the solution region of the query arena are kept apart, so a solve can never read and write the same vector. Upstream's `Eigen` solve copies first; ours does not have to. |
+| `surface_mesh.mojo`, `simple_idt.mojo` | A boundary halfedge is a self-twinned corner here and is also a corner of a real face, so it receives that face's cotangent weight (upstream gives the ghost 0 and the real halfedge the weight). The fan orbit stops when the step leaves the fan, because there is no separate ghost to stop at. |
+| `mesh.py` | `validate_mesh` keeps upstream's `np.amin` index check, which only catches negative indices. The kernels therefore check every face index themselves and report it as `ValueError` with upstream's message; without that an out-of-range positive index walks off the vertex array and kills the process. |
+| `compute_distance`, `compute_distance_multisource` | An out-of-range or empty source set raises rather than returning a field. Upstream indexes its vertex array with the caller's list unchecked; every alternative here (drop the index, or clamp) yields a finite field that is wrong by construction. |
+| `cotan_laplacian`, `face_areas`, `vertex_areas` on a zero-area face | Match upstream, NaNs included. Only the solver refuses that input, because only the solver cannot carry the NaN onward. |
 
 ## How it works
 
-**FFI.** `build/build.sh` runs `mojo build --emit shared-lib -I src src/capi.mojo`,
-producing `dist/libmojo-potpourri3d.so`. `capi.mojo` is the only compilation
-unit; it imports the kernel modules and re-exports them under `mpp3d_` names
-with an explicit `abi("C")` effect, which Mojo requires for `@export`. Because
-`@export` rejects parametric functions and a pointer with an inferred origin is
-parametric, every buffer crosses as an `Int` address and the pointers are
-rebuilt inside the wrapper. `python/mojo_potpourri3d/_lib.py` holds the ctypes
-signatures and builds the library on first import if it is missing or stale;
-`tests/test_parity.py::test_ffi_signatures_match_the_exports` pins every ctypes
-arity against the Mojo source, because an arity mismatch is a silent
-memory-corrupting bug.
+**FFI strategy.** A Mojo function cannot hold state across the C ABI and this dialect has no
+module-level globals, so every solver is driven as three calls over caller-owned arenas:
 
-**Memory layout.** NumPy owns every array. The mesh is a halfedge structure
-mirroring `SurfaceMesh`: face `f` owns halfedges `3f, 3f+1, 3f+2` and the vertex
-indices are the caller's own, so `vertexIndices[v] == v` exactly as upstream.
-Per-vertex quantities are `(n,)` float64; per-halfedge quantities are
-`(3 * n_faces,)` float64; per-edge quantities are stored per halfedge, which is
-the same number of entries because every edge quantity satisfies
-`L(i,j) == L(twin,j)`. The `HalfedgeMesh` struct carries the addresses as `Int`
-rather than pointers, because a Mojo struct field cannot expose `AnyOrigin`.
+1. `pp3d_heat_layout` publishes the arena layout, so Python sizes its buffers from the kernel rather
+   than repeating the formulas.
+2. `pp3d_heat_setup` builds the geometry (with the robust laplacian that means the tufted cover) and
+   the two operators, runs the symbolic analysis of each, and reports `nnz(L)` for both.
+3. Python sizes the factor buffers and calls `pp3d_heat_factor`, which factorises both operators.
+4. Each `pp3d_heat_compute_distance` call is two triangular solves plus the divergence loop.
 
-**The tufted cover.** The robust Laplacian and the point cloud both need a mesh
-in which every edge is manifold but a vertex may not be -- a "tufted" cover.
-`buildIntrinsicTuftedCover` gets there by duplicating every face, inverting the
-copy, and pulling each edge's sibling list apart so that each front halfedge is
-paired with a back one. That needs the general form of `SurfaceMesh`, with
-mutable connectivity, so `general_mesh.mojo` carries it: eight parallel arrays,
-element counts in three `Int64` cells, and the four mutators
-(`duplicate_face`, `invert_orientation`, `separate_to_new_edge`, `flip`) in
-upstream's order. Python sizes the element arrays once, from the fact that the
-cover at most doubles the faces and triples the halfedges. Afterwards the mesh
-is edge-manifold again, so it is handed to the heat method as an ordinary static
-mesh -- with one difference: several edges can share a vertex pair, so the
-twin map cannot be recovered from the face list and is written out explicitly.
-`mollifyIntrinsic` is not a noisy mollifier: it offsets every edge length by the
-single scalar that makes the most degenerate triangle in the mesh just barely
-non-degenerate. `flipToDelaunay` is upstream's queue-driven edge flip to the
-Euclidean Delaunay condition, with the new diagonal length laid out from the
-quad's four sides the way `layoutTriangleVertex` does it.
+`@export` symbols are only emitted from the file handed to `mojo build`, so every kernel module ends
+in plain `def`s that take `Int` addresses and `src/ported.mojo` holds the `@export` wrappers. That,
+and the fact that buffers cross the ABI as addresses, are the only places the dialect diverges from
+upstream's structure; the logic itself stays in the kernels.
 
-**Linear algebra.** geometry-central hands every system to SuiteSparse CHOLMOD.
-That is not available here, so `linalg.mojo` is a self-contained sparse Cholesky:
-Reverse Cuthill-McKee for a fill-reducing ordering, a symbolic pass that derives
-the elimination tree, and a numeric pass in the same recurrence. The heat and
-Poisson operators are symmetric, so the factor is `A = L D L^T` with real `D`.
-The vertex connection Laplacian, which the vector heat method needs, comes out of
-geometry-central *Hermitian* (`A[j,i] = conj(A[i,j])`, real diagonal), so the
-complex path factors `A = L D L^H` with real `D` as well. `W` for a zero pivot is
-clamped to 1e-14; that never triggers for the positive definite heat and Poisson
-operators and is the reason the log map is not covered.
+**Memory layout.** Each kernel module fixes its own arena layout in a `*Layout` struct and publishes
+it through a `*_layout` export, so `python/mojo_potpourri3d/_lib*.py` mirrors the numbers from the
+kernel. Inside an arena the regions are packed in order, each sized by the element count the kernel
+actually writes, so two solvers' arrays cannot overlap however big the operands get. The snapshot of
+the *original* mesh goes first, because the distance shift reads it while the solver is working on
+the tufted cover.
 
-Everything is serial. The pinned toolchain has no `parallelize` and no threading
-primitives in its standard library (see `MOJO_NOTES.md`), so the only places this
-port can beat CHOLMOD are the ones where upstream is doing per-element work in
-C++ rather than calling a multithreaded BLAS. What that rules out, and what a
-GPU path would and would not buy, is spelled out under the benchmark table.
+**The solver.** `src/sparse.mojo` is a sparse symmetric `LDL^T` with an RCM ordering, standing in for
+geometry-central's `PositiveDefiniteSolver` (CHOLMOD's simplicial `LDLt`, or Eigen's
+`SimplicialLDLT`). The matrix arrives as the CSC of its upper triangle including the diagonal, which
+is what upstream hands SuiteSparse as `SType::SYMMETRIC`. The real path (`w == 1`) is what every
+covered method uses and is verified against `scipy.sparse.linalg.spsolve` to 3e-15 in
+`tests/test_sparse.py`.
+
+The complex path (`w == 2`, entries interleaved `(re, im)`) is implemented, and the mirrored entry is
+conjugated so that it factors a Hermitian matrix rather than a complex-symmetric one. It is **not
+usable and not tested**: its numeric phase still rejects a Hermitian positive-definite matrix, which is
+the only kind the vector heat method would hand it, so nothing that depends on it ships.
+`MeshVectorHeatSolver` is the only consumer and it is not covered. The path is carried because the
+connection Laplacian it exists for is not.
+
+The symbolic phase is a left-looking column factorization: the pattern
+of column *k* of *L* is the rows *i > k* reachable from the rows of the matrix below the diagonal,
+closed under the columns already in the pattern.
+
+**Parallelism.** One kernel is parallel: the point cloud's k-nearest-neighbour scan, which divides
+perfectly over the source point and forks to `parallelize` above 1024 points. Everything else, the
+solver included, is serial. There is no GPU path — the kNN scan reads 24 bytes per candidate for about
+5 flops, which is well under the ratio where a launch pays for itself, and the heat method is bound by
+the fill in its factor rather than by throughput.
+
+**Source layout.** One Mojo file per upstream file, in upstream order:
+
+| `src/` | upstream |
+|---|---|
+| `vector_util.mojo` | `utilities/vector2.h`, `vector3.h`, `elementary_geometry.h` |
+| `surface_mesh.mojo` | `surface/surface_mesh.{h,cpp}` (manifold triangulations only) |
+| `intrinsic_geometry_interface.mojo` | `surface/intrinsic_geometry_interface.cpp` |
+| `tufted_laplacian.mojo` | `surface/tufted_laplacian.cpp`, `surface/intrinsic_mollification.cpp` |
+| `simple_idt.mojo` | `surface/simple_idt.cpp` |
+| `heat_method_distance.mojo` | `surface/heat_method_distance.cpp` |
+| `local_triangulation.mojo` | `pointcloud/local_triangulation.cpp` |
+| `point_position_geometry.mojo` | `pointcloud/point_position_geometry.cpp`, `pointcloud/neighborhoods.cpp` |
+| `sparse.mojo` | `numerical/positive_definite_solvers.cpp` |
+| `mesh.mojo` | `potpourri3d/mesh.py` (the module-level helpers) |
+| `ported.mojo` | the `@export` ABI |
 
 ## Benchmarks
 
-Machine: Intel Xeon E5-2697 v4 @ 2.30 GHz, 72 threads, 251 GiB RAM,
-Linux 6.8.0-139-generic, glibc 2.39, CPython 3.13.14, NumPy 2.5.1,
-Mojo 1.2.0.dev2026092605. Produced by `pixi run bench`, which holds a
-machine-wide `flock` so a concurrent factory job cannot distort the numbers.
-Each cell is the best of 3 runs (1 for the largest cases); "speedup" is
-potpourri3d / mojo-potpourri3d, so above 1.0 means the Mojo port is faster.
+Every table below is the verbatim output of `pixi run bench` (`bench/bench.py`, best of 5 per row) on
+this machine. Reproduce them with `pixi run bench`, which takes a machine-wide lock; the script prints
+the environment it measured on in its first section.
 
-| case | mojo-potpourri3d | potpourri3d (geometry-central) | speedup |
-| --- | ---: | ---: | ---: |
-| face_areas (icosphere, 2562 v) | 0.05 ms | 0.82 ms | 15.47x |
-| vertex_areas (icosphere, 2562 v) | 0.07 ms | 0.93 ms | 13.40x |
-| cotan_laplacian (icosphere, 2562 v) | 5.05 ms | 10.23 ms | 2.03x |
-| Heat method: construct (icosphere, 2562 v) | 67.46 ms | 30.56 ms | 0.45x |
-| Heat method: 1 distance query (icosphere, 2562 v) | 1.68 ms | 1.22 ms | 0.73x |
-| Heat method: 32 distance queries (icosphere, 2562 v) | 46.52 ms | 34.87 ms | 0.75x |
-| Heat method: construct, robust Laplacian (icosphere, 2562 v) | 65.27 ms | 40.68 ms | 0.62x |
-| Vector heat: construct (icosphere, 2562 v) | 36.61 ms | 35.76 ms | 0.98x |
-| Vector heat: extend_scalar (icosphere, 2562 v) | 1.36 ms | 0.46 ms | 0.34x |
-| Vector heat: transport_tangent_vectors (icosphere, 2562 v) | 2.95 ms | 1.14 ms | 0.39x |
-| get_connection_laplacian (icosphere, 2562 v) | 0.00 ms | 0.20 ms | 407.26x |
-| Heat method: construct (icosphere, 10242 v) | 644.58 ms | 217.78 ms | 0.34x |
-| Heat method: 1 distance query (icosphere, 10242 v) | 24.65 ms | 9.75 ms | 0.40x |
-| Vector heat: 1 transport query (icosphere, 10242 v) | 16.71 ms | 248.70 ms | 14.88x |
-| Point cloud: local triangulation (2000 points) | 69.74 ms | 40.14 ms | 0.58x |
-| Point cloud: construct (2000 points) | 166.09 ms | 92.58 ms | 0.56x |
-| Point cloud: 1 distance query (2000 points) | 2.33 ms | 31.47 ms | 13.50x |
+The box is shared and heavily loaded, so the wall-clock figures move 10-20% between runs while the
+ratios do not. Read the `ours / upstream` column, not the milliseconds.
 
-This is one run of a shared machine, and the variance is not small: the
-10242-vertex rows are measured once each rather than three times, and across
-four runs of this same code the construct came out at 600, 629, 645 and
-712 ms and the query at 15.6, 19.3, 24.7 and 19.5 ms. `cotan_laplacian`, which
-this pass does not touch, moved by 28% across the same runs. Read the kernel
-figures below, which were taken back to back in one process, as the reliable
-ones and the table as +/-20%.
+### Environment
 
-### What the last optimization pass changed
+```
+Linux 6.8.0-142-generic x86_64, Intel(R) Xeon(R) CPU E5-2697 v4 @ 2.30GHz, 72 cores
+```
 
-Profiling the two paths that dominate every `construct` row -- the COO
-assembly and the sparse LDL^T -- gave these before/after figures, each the
-best of several runs in the same process on the same build:
+### Heat method distance (use_robust=False)
 
-| kernel | before | after | note |
-| --- | ---: | ---: | --- |
-| `ldl_numeric`, icosphere 10242 | 204.6 ms | 153.5 ms | both sparse inner loops batched four entries at a time |
-| `ldl_solve`, icosphere 10242 | 9.1 ms | 6.2 ms | same batching on both triangular solves |
-| `ldl_solve`, icosphere 2562 | 0.65 ms | 0.34 ms | same |
-| `permute_upper`, point cloud operator (146 k triplets) | 46.0 ms | 26.9 ms | per-column bubble sort replaced by one stable radix sort of the whole triplet list |
-| `permute_upper`, mesh operator (133 k triplets) | 9.6 ms | 10.0 ms | a wash: mesh columns hold ~13 entries, where the old sort was already cheap |
-| `compute_neighbors`, 2000 points | 30.6 ms | 30.6 ms | unchanged, see below |
-| `ldl_symbolic`, icosphere 10242 | 90 ms | 90 ms | the same batching was applied here and made no difference that survived the noise, so it was reverted |
+| mesh | vertices | mojo (ms) | upstream (ms) | ours / upstream |
+|---|---|---|---|---|
+| icosphere(1) | 42 | 0.965 | 0.221 | 4.37x |
+| icosphere(2) | 162 | 4.036 | 0.778 | 5.19x |
+| icosphere(3) | 642 | 24.945 | 3.675 | 6.79x |
+| open grid 32 | 1024 | 45.246 | 4.270 | 10.60x |
+| open grid 64 | 4096 | 444.473 | 20.101 | 22.11x |
+### Heat method distance (use_robust=True, upstream's default)
 
-Two things did not pay and were reverted rather than kept:
+| mesh | vertices | mojo (ms) | upstream (ms) | ours / upstream |
+|---|---|---|---|---|
+| icosphere(1) | 42 | 1.293 | 0.317 | 4.08x |
+| icosphere(2) | 162 | 5.653 | 1.073 | 5.27x |
+| icosphere(3) | 642 | 31.462 | 4.352 | 7.23x |
+| open grid 32 | 1024 | 57.185 | 5.830 | 9.81x |
+| open grid 64 | 4096 | 497.840 | 27.112 | 18.36x |
 
-* **Vector gather/scatter in the sparse kernels.** `Pointer.unsafe_gather`
-  and `unsafe_scatter` compile and run on this target, but `vgatherqpd` is
-  microcoded without AVX-512: the four-wide sparse solve measured 10.4 ms
-  against 9.1 ms for the scalar loop it replaced. Four independent scalar
-  accesses issued back to back beat it, and that is what the kernels do.
-* **A SIMD block filter for the point cloud neighbour search.** The scan is
-  O(n^2) and looked like the obvious SIMD target, so it was rewritten to
-  test sixteen points at a time against the running threshold over a
-  struct-of-arrays copy of the cloud, with a max-heap replacing the
-  O(k) shift-insertion. Every variant was slower than the 30.6 ms it
-  replaced (33-50 ms): the array-of-structs layout the scan already uses is
-  three doubles per cache line in one sequential stream, and the insertion
-  was not the cost the profile implied. The original is still what ships.
+### Multi-source distance (three sources, use_robust=False)
 
-One more change did pay, and is in the radix sort: the 256-entry digit
-counter moved from a buffer behind a pointer to a `StaticTuple` local,
-because the compiler could not prove a store to the destination did not
-alias it, and the counter's read-modify-write then serialised the whole pass
-(11.3 ms -> 5.7 ms for the mesh operator's sort).
+| mesh | vertices | mojo (ms) | upstream (ms) | ours / upstream |
+|---|---|---|---|---|
+| icosphere(1) | 42 | 0.919 | 0.224 | 4.10x |
+| icosphere(2) | 162 | 3.962 | 0.770 | 5.14x |
+| icosphere(3) | 642 | 24.218 | 3.208 | 7.55x |
+| open grid 32 | 1024 | 44.620 | 4.074 | 10.95x |
+| open grid 64 | 4096 | 449.432 | 20.419 | 22.01x |
 
-### Parallelism and the GPU: both declined, honestly
+### Setup only (operator build + factorisation, no query)
 
-**No threads.** The pinned toolchain has no `parallelize` and no threading
-primitives in its standard library (`MOJO_NOTES.md` section 4), and no
-replacement was found in the `max` package that compiles. The factorization
-is the one place where threads would pay, and it stays serial.
+| mesh | vertices | mojo (ms) | upstream (ms) | ours / upstream |
+|---|---|---|---|---|
+| icosphere(1) | 42 | 0.901 | 0.196 | 4.58x |
+| icosphere(2) | 162 | 3.848 | 0.723 | 5.32x |
+| icosphere(3) | 642 | 24.360 | 3.001 | 8.12x |
 
-**No GPU path.** `DeviceContext` is not in this toolchain -- not in
-`std.gpu.host`, not in `std.gpu`, and the compiler has no replacement to
-suggest -- so `enqueue_create_buffer`, `enqueue_copy` and
-`enqueue_function` are unavailable too (`MOJO_NOTES.md` section 5). Writing
-a device path against that API would not compile, so none was written. The
-GPU on this machine (an RTX 5090, compute 12.0, 18.3 GiB free of 32.6 GiB)
-is idle as far as this port is concerned. It would not be the right target
-anyway: the hot loops are a sparse triangular solve at well under one flop
-per byte, which is memory bound on a pattern the GPU cannot address without
-gathering through a dense supernode representation this port does not have.
+### Mesh operators
 
-### Reading the table honestly
+| op | mesh | mojo (ms) | upstream (ms) | ours / upstream |
+|---|---|---|---|---|
+| cotan_laplacian / icosphere(1) | 42 | 0.197 | 0.507 | 0.39x |
+| face_areas / icosphere(1) | 42 | 0.010 | 0.062 | 0.16x |
+| vertex_areas / icosphere(1) | 42 | 0.010 | 0.077 | 0.13x |
+| cotan_laplacian / icosphere(2) | 162 | 0.291 | 0.722 | 0.40x |
+| face_areas / icosphere(2) | 162 | 0.012 | 0.096 | 0.12x |
+| vertex_areas / icosphere(2) | 162 | 0.012 | 0.113 | 0.11x |
+| cotan_laplacian / icosphere(3) | 642 | 0.699 | 1.548 | 0.45x |
+| face_areas / icosphere(3) | 642 | 0.020 | 0.192 | 0.10x |
+| vertex_areas / icosphere(3) | 642 | 0.023 | 0.217 | 0.11x |
 
-The elementwise kernels win, and they win big: `face_areas` and `vertex_areas`
-are 13-15x faster because upstream runs a Python loop over faces in NumPy while
-this port does the same arithmetic in a Mojo loop. Neither was touched by this
-pass; they were already far enough ahead.
+### Point cloud local triangulation and tangent frames
 
-`get_connection_laplacian` at 407x is not a speed claim, it is a caching
-artifact. Both sides cache the operator after the first call (upstream via
-geometry-central's `ensureHaveVertexConnectionLaplacian`); upstream still
-rebuilds the returned object on every call and this port returns the cached
-matrix, so the benchmark measures a memcpy against a pointer store. Read it as
-"both are O(1) after the first call", not as a 407x kernel win.
+| cloud | points | local triangulation (ms) | upstream (ms) | ours / upstream |
+|---|---|---|---|---|
+| random sphere | 300 | 5.473 | 4.083 | 1.34x |
+| random sphere | 1000 | 23.898 | 14.232 | 1.68x |
+| random sphere | 3000 | 51.352 | 43.320 | 1.19x |
 
-The losses are real and they are mostly the same reason: **the sparse
-factorization**. Every `construct` row and the 0.34x at 10242 vertices is the
-one-time Cholesky, not the geometry. Measured directly at 10242 vertices
-(20480 faces, 71682 nonzeros in the operator): building the halfedge structure
-takes 10 ms, the intrinsic geometry 30 ms, the cotan triplets 3 ms -- 43 ms
-of real work, all of it competitive, against 200 ms for the COO assembly, the
-symbolic pass and the numeric factorization. This pass cut the numeric pass
-from 205 ms to 154 ms and made the COO assembly 1.7x faster on the point
-cloud's much denser operator, which is where most of the movement in the
-query rows comes from. The factorization is still the wall, and the reason
-is fill and the absence of supernodes: this port's Reverse Cuthill-McKee
-ordering is much weaker than CHOLMOD's AMD, and at this size the factor has
-1.37 M nonzeros against the matrix's 71.7 k -- 19x fill -- which a serial
-left-looking pass then walks entry by entry. CHOLMOD's multithreaded
-supernodal BLAS kernels do the same algebra against a much better-ordered
-factor. Beating that needs a different ordering, not a faster loop.
+### Sparse Cholesky (5-point Laplacian, heat operator shape)
 
-The 0.34x-0.75x query rows are the same effect amortised: a query is two
-back-solves, so once the factorization is slower the per-query number is
-slower too, even though the RHS assembly and the back-solve themselves are
-fast. The back-solve is where this pass paid: `ldl_solve` is 1.4x faster on
-the 10242-vertex factor and 1.9x on the 2562-vertex one, and the complex
-version behind `extend_scalar` and `transport_tangent_vector` got the same
-treatment (1.61 ms -> 1.36 ms and 3.84 ms -> 2.95 ms on the table). The two
-query rows that invert this are the ones where upstream pays for something
-this port does not: complex vector heat transport at 10242 vertices
-(14.88x), and a point cloud distance query (13.50x), where upstream's KD-tree
-neighbour search and its own cover dominate a query that this port has
-already paid for at construction.
+| grid | vertices | nnz(L) | factorise (ms) | solve (ms) |
+|---|---|---|---|---|
+| 20x20 | 400 | 10907 | 1.783 | 0.017 |
+| 40x40 | 1600 | 86607 | 23.415 | 0.032 |
+| 60x60 | 3600 | 291107 | 109.307 | 0.069 |
 
-The point cloud rows are the least flattering and the most honest. The
-0.58x on the local triangulation is the brute-force neighbour search against
-nanoflann's KD-tree, and 0.56x on construction is that plus the same
-factorization story as the mesh rows. The 13.50x on a query is not a claim
-about the kernel: it is the same amortization as everywhere else in this
-table, read the other way. The neighbour search is the one kernel where a
-SIMD rewrite was tried and lost, and the table above says so with numbers.
+**This port is slower than upstream on the heat method distance: 4-8x on the closed icospheres,
+10x on a 1024-vertex grid, 22x on a 4096-vertex grid.** The reason is the solver, not the geometry.
+Upstream links a tuned sparse Cholesky (SuiteSparse/CHOLMOD, or Eigen's supernodal `SimplicialLDLT`)
+that reorders with AMD and exploits supernodes, while `src/sparse.mojo` is a straightforward serial
+left-looking `LDL^T` with RCM ordering and scalar arithmetic. On a 64x64 grid RCM leaves a factor with
+far more fill than AMD would, which is where the largest ratio comes from. The setup-only table shows
+the same shape, which locates the cost in factorisation rather than in the geometry or the divergence
+loop. A later pass can change the ordering, add supernodal blocking and vectorise the kernels; this
+pass deliberately left the structure alone so the port could be read against the upstream source.
 
-The robust-Laplacian construct row (0.62x) is the plain construct row plus the
-cover and the flips, and the cover costs about what the mesh construction does,
-so there is no surprise in it.
+The elementwise operators are 2-6x faster than upstream, and `cotan_laplacian` 2.2-2.6x,
+because upstream runs the same vectorised numpy expression and then assembles a `scipy.sparse` matrix, while this port emits the triplets
+straight out of Mojo. The point cloud's local triangulation is 1.2-1.7x slower, because upstream's
+nanoflann k-nearest-neighbour search is sub-quadratic and this port's exhaustive scan is not. That
+scan does fork to `parallelize` above 1024 points, which is where the 3000-point row closes most of its
+gap; below the threshold it runs serially, so small clouds are its worst case.
 
-This port is correct and complete over its subset first; accelerating the
-factorization without changing the structure it exposes is a later pass. In its
-current state it is the right choice for many queries on a small-to-medium mesh
-and the wrong choice for a one-shot solve on a large one.
+The sparse Cholesky tables have no upstream counterpart: they time the same 5-point Laplacian
+`src/sparse.mojo` factorises inside the heat method, straight through the C ABI, and they are what the
+ratios above are made of. They are verified against `scipy.sparse.linalg.spsolve` to a relative error
+below 1e-13 on random SPD matrices in `tests/test_sparse.py`. The complex path the same file also
+carries is not verified at all; see the coverage section.
 
-## License
+## Licence
 
-MIT, as upstream. See `LICENSE`.
+MIT, matching upstream. See `LICENSE`.

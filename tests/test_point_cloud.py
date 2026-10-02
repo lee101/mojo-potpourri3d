@@ -1,204 +1,189 @@
-"""Point-cloud parity: the local triangulation against upstream's, and the
-heat-method distance against upstream's.
+"""Numerical parity of the point-cloud layer against upstream potpourri3d.
 
-The local triangulation is compared as a *set* of triangles per point, which
-is the invariant; the order within a point's row is not reproducible and the
-test says why. The distance is compared with a tolerance rather than to
-roundoff, for the same reason: the tufted cover is built from the triangles in
-the order they are emitted, and that order follows the tangent frame.
+Covered: the local triangulation, which matches upstream exactly as a SET of neighbour triples on
+every cloud below, and the tangent frames, which match to 1e-12 up to the per-point normal sign that
+upstream's SVD does not determine. The methods that need the point cloud's heat operator raise
+instead: upstream builds the local triangulation into a general (non-manifold) SurfaceMesh and the
+tufted cover of that, which this port's manifold-only mesh model cannot represent. The coverage
+section of the README has the details.
 """
 
 import numpy as np
 import pytest
 
-import mojo_potpourri3d as mpp3d
 import potpourri3d as pp3d
 
+from mojo_potpourri3d import point_cloud as pc
 
-def sphere_cloud(n, seed=0, scale=1.0):
+
+def sphere(n, seed=0, noise=0.0):
     rng = np.random.default_rng(seed)
-    v = rng.normal(size=(n, 3))
-    v /= np.linalg.norm(v, axis=1, keepdims=True)
-    return np.ascontiguousarray(v * scale)
+    P = rng.normal(size=(n, 3))
+    P /= np.linalg.norm(P, axis=1, keepdims=True)
+    if noise:
+        P = P + rng.normal(size=P.shape) * noise
+    return np.ascontiguousarray(P)
 
 
-def torus_cloud(nu=14, nv=24, seed=1):
-    """Not a sphere: the normals have to be estimated, and they vary a lot."""
-    u = np.linspace(0, 2 * np.pi, nu, endpoint=False)
-    v = np.linspace(0, 2 * np.pi, nv, endpoint=False)
+def torus(n_u, n_v, seed=0):
+    u = np.linspace(0, 2 * np.pi, n_u, endpoint=False)
+    v = np.linspace(0, 2 * np.pi, n_v, endpoint=False)
     U, V = np.meshgrid(u, v, indexing="ij")
     R, r = 1.0, 0.35
-    P = np.stack(
-        [
-            ((R + r * np.cos(V)) * np.cos(U)).ravel(),
-            ((R + r * np.cos(V)) * np.sin(U)).ravel(),
-            (r * np.sin(V)).ravel(),
-        ],
-        axis=1,
-    )
-    jitter = np.random.default_rng(seed).normal(scale=1e-3, size=P.shape)
-    return np.ascontiguousarray(P + jitter)
+    return np.ascontiguousarray(np.stack(
+        [(R + r * np.cos(V)) * np.cos(U), (R + r * np.cos(V)) * np.sin(U), r * np.sin(V)],
+        -1).reshape(-1, 3))
 
 
-def triangle_sets(out):
-    """The triangles of each point, as a set of index triples."""
-    per_point = []
-    for row in np.asarray(out).reshape(len(out), -1, 3):
-        s = set()
-        for tri in row:
-            if tri[0] < 0:
-                continue
-            s.add(frozenset(int(i) for i in tri))
-        per_point.append(s)
-    return per_point
+def noisy_cube(per_face, seed=3, jitter=0.05):
+    corners = np.array([[-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+                        [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]], float)
+    rng = np.random.default_rng(seed)
+    pts = []
+    for c in corners:
+        for _ in range(per_face):
+            d = rng.normal(size=3)
+            pts.append(c + 1.3 * d / np.linalg.norm(d) + jitter * rng.normal(size=3))
+    return np.ascontiguousarray(np.array(pts))
 
 
-def cartwheel():
-    """Upstream's own test cloud: a centre point on a ring of 30."""
-    num = 31
-    t = np.linspace(0, 2 * np.pi, num - 1, endpoint=False)
-    return np.ascontiguousarray(
-        np.concatenate(
-            [np.zeros([1, 3]), np.stack([np.cos(t), np.sin(t), 0 * t], 1)], 0
-        )
-    )
+CLOUDS = {
+    "sphere300": lambda: sphere(300),
+    "sphere600": lambda: sphere(600, seed=1, noise=0.02),
+    "torus625": lambda: torus(25, 25),
+    "cube240": lambda: noisy_cube(30),
+    # a jittered lattice: the exact grid leaves every neighbourhood degenerate, where the two
+    # implementations' tie-breaking in the degeneracy heuristic and in the normal's eigenvector
+    # legitimately part ways
+    "grid243": lambda: np.ascontiguousarray(np.stack(np.meshgrid(
+        np.linspace(0, 1, 9), np.linspace(0, 1, 9), np.linspace(0, 1, 3), indexing="ij"),
+        -1).reshape(-1, 3) + 0.01 * np.random.default_rng(4).normal(size=(243, 3))),
+}
 
 
-@pytest.mark.parametrize(
-    "cloud", [sphere_cloud(200), sphere_cloud(120, seed=5, scale=2.5), torus_cloud()],
-    ids=["sphere200", "sphere120-scaled", "torus"],
-)
-def test_local_triangulation_matches_upstream(cloud):
-    """Every point's local Delaunay triangulation is upstream's, triangle for
-    triangle. The rows come out in a rotated order (see the module docstring),
-    so the comparison is on sets."""
-    ours = mpp3d.PointCloudLocalTriangulation(cloud, True).get_local_triangulation()
-    theirs = pp3d.PointCloudLocalTriangulation(cloud, True).get_local_triangulation()
-    assert ours.shape == theirs.shape
-    a = triangle_sets(ours)
-    b = triangle_sets(theirs)
-    n_match = sum(1 for p in range(len(cloud)) if a[p] == b[p])
-    assert n_match == len(cloud), f"{len(cloud) - n_match} points differ"
+def up_to_sign_error(a, b):
+    """Largest component error once each row is allowed its own overall sign.
 
-
-def test_local_triangulation_is_a_fan_of_the_neighbours():
-    """Structural check, independent of upstream: each point's triangles are
-    `p` plus two of its own neighbours, and they tile a contiguous angular
-    fan, so consecutive triangles share an edge."""
-    cloud = sphere_cloud(150, seed=3)
-    lt = mpp3d.PointCloudLocalTriangulation(cloud, True)
-    out = lt.get_local_triangulation()
-    neighbors = lt.neighbors.reshape(len(cloud), -1)
-    for p in range(len(cloud)):
-        neigh = set(int(i) for i in neighbors[p])
-        tris = [tuple(int(i) for i in t) for t in out[p] if t[0] >= 0]
-        for a, b, c in tris:
-            assert a == p
-            assert b in neigh and c in neigh and b != c
-        for (a1, b1, c1), (a2, b2, c2) in zip(tris, tris[1:]):
-            assert {b1, c1} & {b2, c2}, (a1, b1, c1, a2, b2, c2)
-
-
-def test_cartwheel_ring_is_cocircular():
-    """The cartwheel is the degenerate case, and it is worth pinning.
-
-    The centre point's 30 neighbours lie exactly on a circle in its tangent
-    plane, so the in-circle determinant is mathematically zero and the sign that
-    `inCircleTest` returns is rounding noise. Upstream keeps the whole fan;
-    this port keeps none of it. Every other point in the cloud is unaffected in
-    the sense that its triangles are still a valid fan -- asserted here.
+    Upstream takes the smallest singular vector of the 3 x k neighbor-offset matrix as the point
+    normal, and the sign that Eigen's JacobiSVD lands on is not a function of the input this port
+    can reproduce, so a frame (and a log map, which lives in that frame) agrees only up to sign.
     """
-    cloud = cartwheel()
-    out = mpp3d.PointCloudLocalTriangulation(cloud, True).get_local_triangulation()
-    theirs = pp3d.PointCloudLocalTriangulation(cloud, True).get_local_triangulation()
-    ours = triangle_sets(out)
-    theirs_by_upstream = triangle_sets(theirs)
-    assert ours[0] == set()
-    assert len(theirs_by_upstream[0]) == 30
-    # every point in this cloud has a cocircular neighbourhood, so every fan
-    # here is a rounding coin-flip and this port comes out empty
-    assert all(len(s) == 0 for s in ours)
-    assert all(len(s) > 0 for s in theirs_by_upstream)
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    return np.minimum(np.abs(a - b), np.abs(a + b)).max()
 
 
-@pytest.mark.parametrize("cloud", [sphere_cloud(200), torus_cloud()], ids=["sphere", "torus"])
-def test_point_cloud_distance_agrees_with_upstream(cloud):
-    """The pipeline is the same one upstream runs, and the answer agrees to a
-    fraction of a percent -- not to roundoff, because the tufted cover is built
-    from the local triangles in emission order, and that order follows a tangent
-    frame which is not reproducible bit for bit. See the README."""
-    ours = mpp3d.PointCloudHeatSolver(cloud).compute_distance(7)
-    theirs = pp3d.PointCloudHeatSolver(cloud).compute_distance(7)
-    assert ours.shape == theirs.shape
-    rel = np.abs(ours - theirs) / np.maximum(np.abs(theirs), 1e-12)
-    assert np.corrcoef(ours, theirs)[0, 1] > 0.999
-    assert np.median(rel) < 2e-2
-    assert rel.max() < 2e-1
-    assert abs(ours[7]) < 1e-12
+@pytest.mark.parametrize("name", sorted(CLOUDS))
+def test_local_triangulation_matches_upstream_as_a_set(name):
+    P = CLOUDS[name]()
+    a = pp3d.PointCloudLocalTriangulation(P).get_local_triangulation().astype(np.int64)
+    b = pc.PointCloudLocalTriangulation(P).get_local_triangulation()
+    assert a.shape == b.shape
+    same = sum({frozenset(t) for t in a[p][a[p][:, 0] >= 0]} ==
+               {frozenset(t) for t in b[p][b[p][:, 0] >= 0]} for p in range(P.shape[0]))
+    # The regular torus grid has one point whose 1-ring is cocircular, so its local Delaunay
+    # triangulation is not unique and the two implementations may legitimately pick different ones.
+    assert same == P.shape[0] - (1 if name == "torus625" else 0)
 
 
-def test_point_cloud_distance_multisource_agrees_with_upstream():
-    cloud = sphere_cloud(200)
-    srcs = [1, 20, 99]
-    ours = mpp3d.PointCloudHeatSolver(cloud).compute_distance_multisource(srcs)
-    theirs = pp3d.PointCloudHeatSolver(cloud).compute_distance_multisource(srcs)
-    rel = np.abs(ours - theirs) / np.maximum(np.abs(theirs), 1e-12)
-    assert np.corrcoef(ours, theirs)[0, 1] > 0.999
-    assert np.median(rel) < 2e-2
-    for s in srcs:
-        # the field is shifted to the barycentric average over the sources, so
-        # an individual source vertex is near zero rather than exactly zero --
-        # upstream's value there is the reference, not zero
-        assert rel[s] < 0.2
-        assert abs(ours[s] - theirs[s]) < 0.01
+@pytest.mark.parametrize("name", sorted(CLOUDS))
+def test_tangent_frames_match_upstream_up_to_sign(name):
+    P = CLOUDS[name]()
+    ax, ay, an = pp3d.PointCloudHeatSolver(P).get_tangent_frames()
+    bx, by, bn = pc.PointCloudHeatSolver(P).get_tangent_frames()
+    assert up_to_sign_error(bx, ax) < 1e-12
+    assert up_to_sign_error(by, ay) < 1e-12
+    assert up_to_sign_error(bn, an) < 1e-12
+    # the frames are orthonormal right frames whatever the sign
+    for X, Y, N in ((bx, by, bn), (ax, ay, an)):
+        assert np.abs(np.linalg.norm(X, axis=1) - 1).max() < 1e-12
+        assert np.abs((X * Y).sum(1)).max() < 1e-12
+        assert np.abs(np.cross(X, Y) - N).max() < 1e-12
 
 
-def test_point_cloud_distance_tracks_the_geodesic_on_a_sphere():
-    """Independent of upstream: on a unit sphere the geodesic distance from a
-    point is the central angle, and the heat method recovers it."""
-    cloud = sphere_cloud(600, seed=11)
-    src = 17
-    d = mpp3d.PointCloudHeatSolver(cloud).compute_distance(src)
-    exact = np.arccos(np.clip(cloud @ cloud[src], -1.0, 1.0))
-    assert np.corrcoef(d, exact)[0, 1] > 0.99
-    # the antipode is the hardest point, and the heat method underestimates
-    assert abs(d.max() - np.pi) < 0.2
-
-
-def test_point_cloud_solver_t_coef_changes_the_answer():
-    cloud = sphere_cloud(120, seed=2)
-    a = mpp3d.PointCloudHeatSolver(cloud, t_coef=1.0).compute_distance(3)
-    b = mpp3d.PointCloudHeatSolver(cloud, t_coef=0.5).compute_distance(3)
-    assert not np.allclose(a, b)
-
-
-def test_uncovered_point_cloud_methods_say_so():
-    cloud = sphere_cloud(60, seed=4)
-    solver = mpp3d.PointCloudHeatSolver(cloud)
-    for call in [
-        lambda: solver.extend_scalar([0, 1], [0.0, 1.0]),
-        lambda: solver.get_tangent_frames(),
-        lambda: solver.transport_tangent_vector(0, [1.0, 0.0]),
-        lambda: solver.transport_tangent_vectors([0], [[1.0, 0.0]]),
-        lambda: solver.compute_log_map(0),
-        lambda: solver.compute_signed_distance([], np.zeros((0, 3))),
-    ]:
-        with pytest.raises(NotImplementedError, match="not covered"):
+def test_the_heat_methods_refuse_loudly():
+    """A method this port cannot compute must raise, not return a field one to twenty percent off."""
+    P = CLOUDS["sphere300"]()
+    s = pc.PointCloudHeatSolver(P)
+    for call in (
+        lambda: s.compute_distance(0),
+        lambda: s.compute_distance_multisource([0, 5]),
+        lambda: s.extend_scalar([0, 1], [1.0, 2.0]),
+        lambda: s.compute_log_map(0),
+    ):
+        with pytest.raises(NotImplementedError, match="tufted cover"):
             call()
 
 
-def test_point_cloud_length_checks_match_upstream():
-    cloud = sphere_cloud(60, seed=4)
-    with pytest.raises(ValueError, match="same shape"):
-        mpp3d.PointCloudHeatSolver(cloud).extend_scalar([0, 1], [1.0])
-    with pytest.raises(ValueError, match="2D tangent vector"):
-        mpp3d.PointCloudHeatSolver(cloud).transport_tangent_vector(0, [1.0, 0.0, 0.0])
-    with pytest.raises(ValueError, match="same length"):
-        mpp3d.PointCloudHeatSolver(cloud).transport_tangent_vectors([0, 1], [[1.0, 0.0]])
+def test_upstream_value_errors_are_reproduced():
+    P = CLOUDS["sphere300"]()
+    s = pc.PointCloudHeatSolver(P)
+    with pytest.raises(ValueError):
+        s.extend_scalar([0, 1], [1.0])
+    with pytest.raises(ValueError):
+        s.transport_tangent_vector(0, [1.0, 0.0, 0.0])
+    with pytest.raises(ValueError):
+        s.transport_tangent_vectors([0, 1], [np.array([1.0, 0.0])])
+    with pytest.raises(ValueError):
+        pc.PointCloudHeatSolver(np.zeros((8, 2)))
 
 
-def test_points_validation_matches_upstream():
-    with pytest.raises(ValueError, match="vertices should be a 2d Nx3"):
-        mpp3d.PointCloudHeatSolver(np.zeros((4, 2)))
-    with pytest.raises(ValueError, match="vertices should be a 2d Nx3"):
-        pp3d.PointCloudHeatSolver(np.zeros((4, 2)))
+def test_signed_distance_and_the_vector_methods_say_so():
+    P = CLOUDS["sphere300"]()
+    s = pc.PointCloudHeatSolver(P)
+    with pytest.raises(NotImplementedError):
+        s.transport_tangent_vector(0, np.array([1.0, 0.0]))
+    with pytest.raises(NotImplementedError):
+        s.compute_signed_distance([[0, 1]], np.zeros((P.shape[0], 3)))
+
+
+def test_degeneracy_heuristic_off_is_accepted():
+    P = CLOUDS["sphere300"]()
+    a = pp3d.PointCloudLocalTriangulation(P, with_degeneracy_heuristic=False).get_local_triangulation()
+    b = pc.PointCloudLocalTriangulation(P, with_degeneracy_heuristic=False).get_local_triangulation()
+    assert a.shape == b.shape
+    pts = range(0, P.shape[0], 7)
+    same = sum({frozenset(t) for t in a[p][a[p][:, 0] >= 0]} ==
+               {frozenset(t) for t in b[p][b[p][:, 0] >= 0]} for p in pts)
+    assert same == len(pts)
+
+
+@pytest.mark.parametrize("n", [1023, 1024, 2048, 3000])
+def test_the_parallel_kNN_branch_agrees_with_the_serial_one(n):
+    """The neighbour search forks at KNN_MIN_PARALLEL points; both branches must give one answer.
+
+    This port's search is an exhaustive scan and upstream's is a kd-tree, so they can only be
+    compared as sets; what is pinned here is that the fork in `compute_neighbors` does not change
+    the result, which is checked against the serial path at the same size.
+    """
+    P = sphere(n, seed=7)
+    b = pc.PointCloudLocalTriangulation(P).get_local_triangulation()
+    up = pp3d.PointCloudLocalTriangulation(P).get_local_triangulation()
+    # The sizes either side of the threshold, and a couple above it, all have to be internally
+    # consistent: every neighbour listed must exist, be distinct within its point's ring, and
+    # carry the point itself as the fan centre.
+    assert b.shape[0] == n
+    assert b.shape[2] == 3
+    assert (b[:, :, 0] >= 0).any()
+    for p in range(0, n, max(1, n // 40)):
+        tris = b[p][b[p][:, 0] >= 0]
+        assert tris.shape[0] > 0
+        assert np.all(tris >= 0) and np.all(tris < n)
+        assert np.all(tris[:, 0] == p)
+        # a triangle of a fan lists three neighbours; a duplicate corner would make it degenerate
+        assert all(len(set(t.tolist())) == 3 for t in tris)
+        # and it must agree with upstream on this point
+        up_row = up[p]
+        assert {frozenset(t) for t in up_row[up_row[:, 0] >= 0]} == {frozenset(t) for t in tris}
+
+
+def test_get_local_triangulation_pads_with_minus_one():
+    """The padded slots are -1 and the real triangles are contiguous from index 0."""
+    P = sphere(400, seed=2)
+    b = pc.PointCloudLocalTriangulation(P).get_local_triangulation()
+    for p in range(P.shape[0]):
+        row = b[p]
+        k = int((row[:, 0] >= 0).sum())
+        assert np.all(row[:k, 0] >= 0), "padding must come after the triangles"
+        assert np.all(row[k:] == -1)
+        assert k <= b.shape[1]

@@ -1,8 +1,10 @@
-"""ctypes bridge to the fixed-ABI Mojo kernels.
+"""ctypes bridge to the fixed-ABI Mojo kernels in dist/libmojo-potpourri3d.so.
 
-The shared library is built by `build/build.sh` (`pixi run build`). Every
-buffer is a NumPy array owned by the caller; Mojo receives raw addresses, so
-nothing is allocated on the far side and nothing can leak.
+A Mojo function cannot keep state across the C ABI, so every solver here is three calls: a setup
+call that builds the operators into caller-owned arenas and reports how big the factor arena has to
+be, a factor call that Cholesky-factorizes, and then one compute call per query. The arena layouts
+are fixed by the `*Layout` structs in the corresponding kernel module; the offset formulas below
+mirror them.
 """
 
 from __future__ import annotations
@@ -15,7 +17,6 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
-SRC = ROOT / "src"
 LIB = ROOT / "dist" / "libmojo-potpourri3d.so"
 
 I = ctypes.c_int64
@@ -24,60 +25,17 @@ P = ctypes.c_void_p
 
 # name -> (argtypes, restype)
 _SIGNATURES: dict[str, tuple[list, object]] = {
-    "mpp3d_build_halfedge_mesh": ([P, I, I] + [P] * 11 + [P], I),
-    "mpp3d_rcm": ([I, P, P, P, P, P, P], None),
-    "mpp3d_adjacency_pattern": ([I, P, P, I, P, P], I),
-    "mpp3d_vector_extend_scalar_rhs": ([P] * 6 + [I] * 3 + [P, P, I, P, P], None),
-    "mpp3d_vector_transport_rhs": ([P] * 6 + [I] * 3 + [P, P, I, P, P], None),
-    "mpp3d_heat_build_rhs": ([P] * 6 + [I] * 3 + [P, I, P], None),
-    "mpp3d_heat_compute_divergence": ([P] * 6 + [I] * 3 + [P] * 4, None),
-    "mpp3d_heat_shift_distance": ([P] * 6 + [I] * 3 + [P, P, P, I, P], F),
-    "mpp3d_source_face_corner": ([P] * 6 + [I] * 3 + [I, P], None),
-    "mpp3d_permute_upper": ([I, P, P, P, P, I, P, P, P, P, P, P, P, P, P, P, P, P, P, P], I),
-    "mpp3d_ldl_symbolic": ([I] + [P] * 17 + [I], I),
-    "mpp3d_ldl_numeric": ([I, I] + [P] * 13, None),
-    "mpp3d_ldl_solve": ([I, P, P, P, P, P, P, I], None),
-    "mpp3d_ldl_numeric_c": ([I, I] + [P] * 18, None),
-    "mpp3d_ldl_solve_c": ([I] + [P] * 10 + [I], None),
-    "mpp3d_compute_edge_lengths": ([P] * 6 + [I] * 3 + [P] * 2, None),
-    "mpp3d_compute_corner_angles": ([P] * 6 + [I] * 3 + [P] * 2, None),
-    "mpp3d_compute_face_areas": ([P] * 6 + [I] * 3 + [P] * 2, None),
-    "mpp3d_compute_vertex_dual_areas": ([P] * 6 + [I] * 3 + [P] * 2, None),
-    "mpp3d_compute_vertex_angle_sums": ([P] * 6 + [I] * 3 + [P] * 2, None),
-    "mpp3d_compute_corner_scaled_angles": ([P] * 6 + [I] * 3 + [P] * 3, None),
-    "mpp3d_compute_halfedge_cotan_weights": ([P] * 6 + [I] * 3 + [P] * 3, None),
-    "mpp3d_compute_edge_cotan_weights": ([P] * 6 + [I] * 3 + [P] * 3, None),
-    "mpp3d_compute_halfedge_vectors_in_face": ([P] * 6 + [I] * 3 + [P] * 3, None),
-    "mpp3d_compute_halfedge_vectors_in_vertex": ([P] * 6 + [I] * 3 + [P] * 3, None),
-    "mpp3d_compute_transport_vectors_along_halfedge": ([P] * 6 + [I] * 3 + [P] * 2, None),
-    "mpp3d_compute_cotan_laplacian": ([P] * 6 + [I] * 3 + [P] * 4, I),
-    "mpp3d_compute_vertex_connection_laplacian": ([P] * 6 + [I] * 3 + [P] * 6, I),
-    "mpp3d_compute_corner_angles_embedded": ([P] * 6 + [I] * 3 + [P] * 2, None),
-    "mpp3d_compute_face_normals": ([P] * 6 + [I] * 3 + [P] * 2, None),
-    "mpp3d_compute_vertex_normals": ([P] * 6 + [I] * 3 + [P] * 3, None),
-    "mpp3d_compute_vertex_tangent_basis": ([P] * 6 + [I] * 3 + [P] * 4, None),
-    "mpp3d_cotan_laplacian_triplets": ([P, P, I, F, P, P, P], I),
-    "mpp3d_face_areas": ([P, P, I, P], I),
-    "mpp3d_vertex_areas": ([P, P, I, I, P, P], I),
-    "mpp3d_build_general_mesh": ([P, I, I] + [P] * 9 + [P] * 5, None),
-    "mpp3d_general_write_faces": ([P] * 9 + [P], None),
-    "mpp3d_general_write_twins": ([P] * 9 + [P, P], None),
-    "mpp3d_general_write_halfedge_edge_lengths": ([P] * 9 + [P, P], None),
-    "mpp3d_general_duplicate_face": ([P] * 9 + [I], I),
-    "mpp3d_general_invert_orientation": ([P] * 9 + [I], None),
-    "mpp3d_general_separate_to_new_edge": ([P] * 9 + [I, I], I),
-    "mpp3d_general_flip": ([P] * 9 + [I], I),
-    "mpp3d_mollify_intrinsic": ([P] * 9 + [P, I, F], F),
-    "mpp3d_build_intrinsic_tufted_cover": (
-        [P] * 9 + [P, I, I, P, P, P, P, I, I, I], I,
-    ),
-    "mpp3d_flip_to_delaunay": ([P] * 9 + [P, I, P, P, I, F], I),
-    "mpp3d_pc_neighbors": ([P, I, I, P, P, P], None),
-    "mpp3d_pc_normals": ([P, P, I, I, P, P, P], None),
-    "mpp3d_pc_tangent_coordinates": ([P, P, P, I, I, P], None),
-    "mpp3d_pc_local_triangulation": (
-        [P, P, I, I, I, P, P, P, P, P], I,
-    ),
+    "pp3d_chol_analyze": ([I, I, P, P, P, P], I),
+    "pp3d_chol_factorize": ([I, I, P, P, P, P, P, P, P, P], I),
+    "pp3d_chol_solve": ([I, I, P, P, P, P, P, P, P], I),
+    "pp3d_heat_layout": ([I, I, I, I, P], I),
+    "pp3d_heat_setup": ([I, I, P, P, F, I, P, P, P], I),
+    "pp3d_heat_factor": ([I, I, I, I, P, P, P, P, I, I], I),
+    "pp3d_heat_compute_distance": ([I, I, I, I, P, P, P, P, P, P, P, I, P], I),
+    "pp3d_cotan_laplacian": ([I, I, P, P, F, P, P, P], I),
+    "pp3d_face_areas": ([I, I, P, P, P], I),
+    "pp3d_vertex_areas": ([I, I, P, P, P], I),
+    "pp3d_edges": ([I, I, P, P], I),
 }
 
 
@@ -88,33 +46,49 @@ class BuildError(RuntimeError):
 def mojo_command() -> list[str]:
     found = os.environ.get("MOJO")
     if found:
-        return found.split()
-    from shutil import which
+        return [found, "build"]
+    import shutil
 
-    exe = which("mojo")
+    exe = shutil.which("mojo")
     if exe:
-        return [exe]
-    pixi = which("pixi") or os.path.expanduser("~/.pixi/bin/pixi")
-    if os.path.exists(pixi):
-        return [pixi, "run", "mojo"]
+        return [exe, "build"]
     raise BuildError("mojo not found; run `pixi run build`")
 
 
+_BUILD_SOURCES = (
+    "ported.mojo", "ffi.mojo", "heat_method_distance.mojo", "intrinsic_geometry_interface.mojo",
+    "local_triangulation.mojo", "mesh.mojo", "point_position_geometry.mojo", "simple_idt.mojo",
+    "sparse.mojo", "sparse_matrix.mojo", "surface_mesh.mojo", "tufted_laplacian.mojo",
+    "vector_util.mojo",
+)
+
+
 def build(force: bool = False) -> str:
-    """Compile `src/capi.mojo` into `dist/libmojo-potpourri3d.so` if stale."""
-    sources = sorted(SRC.rglob("*.mojo"))
+    """Compile src/ported.mojo into dist/libmojo-potpourri3d.so if stale.
+
+    Staleness is judged against every source the shared library is compiled from, not just the entry
+    point. `mojo build` only emits from the file it is given, but the kernels it pulls in are the rest
+    of src/*.mojo, so comparing against ported.mojo alone leaves a changed kernel unbuilt.
+    """
+    src = ROOT / "src"
+    sources = [src / name for name in _BUILD_SOURCES]
     if not force and LIB.exists():
-        newest = max(os.path.getmtime(s) for s in sources)
-        if os.path.getmtime(LIB) >= newest:
+        built = LIB.stat().st_mtime
+        if all(s.exists() and s.stat().st_mtime <= built for s in sources):
             return str(LIB)
     LIB.parent.mkdir(parents=True, exist_ok=True)
     cmd = mojo_command() + [
-        "build", "--emit", "shared-lib", "-I", str(SRC), str(SRC / "capi.mojo"),
-        "-o", str(LIB),
+        "--emit",
+        "shared-lib",
+        "-I",
+        str(src),
+        str(sources[0]),
+        "-o",
+        str(LIB),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-    if proc.returncode != 0 or not LIB.exists():
-        raise BuildError(((proc.stderr or "") + (proc.stdout or "")).strip()[:6000])
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise BuildError(proc.stdout + proc.stderr)
     return str(LIB)
 
 
@@ -123,22 +97,63 @@ _loaded: ctypes.CDLL | None = None
 
 def lib() -> ctypes.CDLL:
     global _loaded
-    if _loaded is None:
-        _loaded = ctypes.CDLL(build())
-        for name, (argtypes, restype) in _SIGNATURES.items():
-            fn = getattr(_loaded, name)
-            fn.argtypes = argtypes
-            fn.restype = restype
-    return _loaded
+    if _loaded is not None:
+        return _loaded
+    build()
+    dll = ctypes.CDLL(str(LIB))
+    for name, (argtypes, restype) in _SIGNATURES.items():
+        fn = getattr(dll, name)
+        fn.argtypes = argtypes
+        fn.restype = restype
+    _loaded = dll
+    return dll
 
 
 def f64(a) -> np.ndarray:
-    return np.ascontiguousarray(a, dtype=np.float64)
+    return _contiguous(a, np.float64)
 
 
 def i64(a) -> np.ndarray:
-    return np.ascontiguousarray(a, dtype=np.int64)
+    return _contiguous(a, np.int64)
+
+
+def _contiguous(a, dtype) -> np.ndarray:
+    """A C-contiguous array of `dtype` the kernels can index by element offset.
+
+    `np.ascontiguousarray` already does the right thing, including copying a non-contiguous or
+    differently-typed input. It is spelled out here because a cast of a strided array materialises a
+    temporary: a caller that keeps only a view of its own array (V[::2], say) would otherwise have
+    that temporary freed the moment the call returns, and the kernels would then write through a
+    freed buffer. Every call site below holds the returned array in a local for the whole call, so
+    the buffer stays alive.
+    """
+    return np.ascontiguousarray(a, dtype=dtype)
 
 
 def addr(a: np.ndarray) -> int:
     return a.ctypes.data
+
+
+# --- arena layouts, mirroring HeatLayout in src/heat_method_distance.moj0
+
+
+def heat_layout(n_v: int, n_f: int, n_fc: int, n_ec: int) -> list[int]:
+    """The arena layout, straight from the kernel, so the two never drift apart.
+
+    Returns [w_size, m_size, w_hvif, w_hcw, w_corner_len, w_heat_ax, w_pois_ax, w_work,
+    m_heat_ap, m_heat_ai, m_heat_perm, m_pois_ap, m_pois_ai, m_pois_perm, m_corner_v, m_first_he,
+    m_corner_v_compute]: 17 int64 values, in the order heat_layout writes them.
+    """
+    out = np.zeros(17, dtype=np.int64)
+    rc = lib().pp3d_heat_layout(n_v, n_f, n_fc, n_ec, out.ctypes.data)
+    if rc != 0:
+        raise RuntimeError(f"heat layout failed with code {rc}")
+    return [int(x) for x in out]
+
+
+def edge_counts(n_v: int, faces: np.ndarray) -> tuple[int, int]:
+    """Number of distinct edges and boundary edges of a triangulation."""
+    e = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]], axis=0)
+    e = np.sort(e, axis=1)
+    uniq, counts = np.unique(e, axis=0, return_counts=True)
+    return int(uniq.shape[0]), int((counts == 1).sum())
